@@ -19,12 +19,14 @@ Toggle dark/light mode for the whole app.
 
 ## Requirements
 
-- Python 3.9+
-- [ffmpeg](https://ffmpeg.org/) on your system PATH
+**If you're using the prebuilt .exe (Windows):**
+- [ffmpeg](https://ffmpeg.org/) on your system PATH (only needed for the YouTube download feature)
 
-```bash
-pip install -r requirements.txt
-```
+**If you're running from source (`spotify_playlist_to_m3u.py`):**
+- Python 3.9+
+- ffmpeg on your system PATH
+- ```bash
+  pip install -r requirements.txt
 
 ## Usage
 
