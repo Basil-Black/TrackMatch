@@ -287,6 +287,17 @@ def style_optionmenu(widget, menu):
     register(apply)
 
 
+def add_credit_footer(window):
+    """Adds a small 'Made by Basil-Black' strip pinned to the bottom of a
+    window. Must be called BEFORE any other widgets are packed into the
+    window, since pack() reserves this bottom sliver first and lets
+    everything else fill the remaining space above it."""
+    footer = tk.Label(window, text="Made by Basil-Black", font=("", 8))
+    style_label(footer, subtle=True)
+    footer.pack(side="bottom", pady=(2, 6))
+    return footer
+
+
 def app_base_dir() -> Path:
     """Folder the script/exe lives in - works whether running as a .py or a
     PyInstaller-built .exe (where sys.executable is the exe's own path)."""
@@ -909,6 +920,7 @@ class DownloadReviewWindow(tk.Toplevel):
         style_window(self)
         set_window_icon(self, ICON_PATH)
         enable_dark_titlebar(self)
+        add_credit_footer(self)
 
         self.items = items
         self.dest_dir = dest_dir
@@ -1234,6 +1246,7 @@ class ReviewWindow(tk.Toplevel):
         style_window(self)
         set_window_icon(self, ICON_PATH)
         enable_dark_titlebar(self)
+        add_credit_footer(self)
 
         self.items = items                # every track: [{"track","candidate","score"}, ...]
         self.output = output
@@ -1396,6 +1409,7 @@ class YouTubeResultsWindow(tk.Toplevel):
         style_window(self)
         set_window_icon(self, ICON_PATH)
         enable_dark_titlebar(self)
+        add_credit_footer(self)
 
         self.row_idx = row_idx
         self.track = track
@@ -1679,6 +1693,7 @@ class App(tk.Tk):
         retheme_all()
         set_window_icon(self, ICON_PATH)
         enable_dark_titlebar(self)
+        add_credit_footer(self)
 
         notebook = ttk.Notebook(self)
         notebook.pack(fill="both", expand=True)
