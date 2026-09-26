@@ -2,7 +2,7 @@
 """
 TrackMatch
 
-Three tabs:
+Four tabs:
 
   1) Download Missing Tracks
      Pick a playlist CSV (from exportify.net) and a folder to check against.
@@ -17,13 +17,20 @@ Three tabs:
      into a folder. Every track is shown for review - worst matches
      first - before anything is written.
 
-  3) Settings
+  3) Metadata Editor
+     Pick a folder of music and search Beatport for cover art, genre,
+     label, year, BPM and key for each file. Works best with EDM/electronic tracks, since
+     Beatport's catalog is dance-music focused - other genres will mostly
+     come back "None found". Nothing is written until you approve it per
+     file in the review window.
+
+  4) Settings
      Toggle dark/light mode for the whole program, including any open
      review/results windows. Saved to a small settings file next to this
      script so your choice persists between runs.
 
 Requirements:
-    pip install mutagen yt-dlp
+    pip install mutagen yt-dlp requests beautifulsoup4
 
 yt-dlp also needs ffmpeg on your PATH for audio extraction/conversion.
 
@@ -32,6 +39,7 @@ Custom title bar icon:
     to its filename, e.g. ICON_PATH = "my_icon.ico".
 """
 
+import base64
 import csv
 import ctypes
 import difflib
@@ -48,6 +56,9 @@ from tkinter import filedialog, messagebox, scrolledtext, ttk
 
 try:
     from mutagen import File as MutagenFile
+    from mutagen.id3 import APIC, TALB, TBPM, TCON, TDRC, TIT2, TKEY, TPE1, TPUB, TSRC
+    from mutagen.flac import Picture
+    from mutagen.mp4 import MP4Cover, MP4FreeForm
 except ImportError:
     MutagenFile = None
 
@@ -56,15 +67,25 @@ try:
 except ImportError:
     yt_dlp = None
 
+try:
+    import requests
+except ImportError:
+    requests = None
 
-AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".wma", ".aac"}
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+
+AUDIO_EXTENSIONS = {".mp3", ".flac", ".m4a", ".ogg", ".opus", ".wav", ".aiff", ".aif", ".wma", ".aac"}
 
 YT_FORMATS = ["mp3", "m4a", "opus", "flac"]
 YT_BITRATES = ["320", "256", "192", "128", "96"]  # kbps; ignored by lossless formats like flac
 
 # Set this to an .ico (preferred) or .png file sitting next to this script
 # to change the window/title-bar icon. Leave as None to use the default.
-ICON_PATH = "icon.ico"
+ICON_PATH = "icon.ico" #"my_icon.ico"
 
 # Column names that different export tools use for the same data.
 # Matched case-insensitively against the CSV header row.
@@ -469,6 +490,35 @@ def read_local_metadata(filepath: Path):
     return title, artist
 
 
+def read_existing_tags(filepath: Path):
+    """Reads whatever Title/Artist/Album/Genre tags already exist on a file -
+    used by the Metadata Editor as a fallback for any field Beatport doesn't
+    supply, so applying a match never blanks out good existing data. Falls
+    back to filename parsing for title/artist only, same as
+    read_local_metadata - album/genre have no meaningful filename fallback."""
+    title, artist, album, genre = "", "", "", ""
+    try:
+        audio = MutagenFile(filepath, easy=True)
+        if audio and audio.tags:
+            title = (audio.tags.get("title") or [""])[0]
+            artist = (audio.tags.get("artist") or [""])[0]
+            album = (audio.tags.get("album") or [""])[0]
+            genre = (audio.tags.get("genre") or [""])[0]
+    except Exception:
+        pass
+
+    if not title:
+        stem = filepath.stem
+        if " - " in stem:
+            guessed_artist, guessed_title = stem.split(" - ", 1)
+            title = title or guessed_title
+            artist = artist or guessed_artist
+        else:
+            title = stem
+
+    return {"title": title, "artist": artist, "album": album, "genre": genre}
+
+
 def index_music_folder(music_dir: Path, log):
     log(f"Scanning {music_dir} for audio files...")
     all_files = [p for p in music_dir.rglob("*") if p.suffix.lower() in AUDIO_EXTENSIONS]
@@ -690,6 +740,389 @@ def write_local_tags(file_path: Path, title: str, artist: str, album: str, genre
         log(f"  Could not update tags on \"{file_path.name}\": {e}")
 
 
+# ---------- Beatport metadata lookup ----------
+# Beatport has no public API, so this reads the __NEXT_DATA__ JSON blob
+# embedded in their search page's HTML (the same technique used by the
+# standalone Beatport Cover Finder tool). Catalog is dance/electronic
+# focused - other genres will mostly come back with no results.
+
+BEATPORT_SEARCH_URL = "https://www.beatport.com/search/tracks?q={query}"
+BEATPORT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+BEATPORT_COVER_SIZE = 500  # px, square - Beatport's CDN resizes the release artwork to this
+
+# A Beatport result has to score at least this well against the file's own
+# title/artist to be pre-selected in the review window. Anything lower is
+# shown for manual picking but defaults to "don't change", so Apply All
+# never writes another song's cover/genre into a file.
+BEATPORT_MIN_SCORE = 0.75
+
+# Beatport tags same-named artists with a disambiguator, e.g. "FISHER (OZ)" -
+# stripped before comparing against local tags, which never have it.
+ARTIST_DISAMBIGUATOR_RE = re.compile(r"\s*\([^()]*\)")
+
+
+def _find_beatport_track_list(node):
+    """Recursively looks for the first list of dicts that look like
+    Beatport track objects - identified by the presence of a 'track_name'
+    field, confirmed against a real response - rather than assuming a
+    specific wrapper key name like 'tracks'. Beatport's actual shape is a
+    flat list directly under state.data['data'], with no 'tracks' nesting."""
+    if isinstance(node, list):
+        if node and isinstance(node[0], dict) and "track_name" in node[0]:
+            return node
+        for item in node:
+            result = _find_beatport_track_list(item)
+            if result is not None:
+                return result
+    elif isinstance(node, dict):
+        for value in node.values():
+            result = _find_beatport_track_list(value)
+            if result is not None:
+                return result
+    return None
+
+
+def _beatport_name(value, *keys):
+    """Beatport nests names inconsistently: genre is a LIST of
+    {'genre_name'} dicts, sub_genre/label/release are single dicts, and
+    some fields are plain strings. Returns the first non-empty name from
+    whichever shape it is, or ""."""
+    if isinstance(value, list):
+        for v in value:
+            name = _beatport_name(v, *keys)
+            if name:
+                return name
+        return ""
+    if isinstance(value, dict):
+        for k in keys + ("name",):
+            if value.get(k):
+                return str(value[k]).strip()
+        return ""
+    return value.strip() if isinstance(value, str) else ""
+
+
+def beatport_key_to_tag(key_name: str) -> str:
+    """'G Major' -> 'G', 'A Minor' -> 'Am', 'F# Minor' -> 'F#m' - the
+    short form ID3 TKEY expects and Rekordbox/Serato/Traktor all read."""
+    key_name = (key_name or "").replace("♯", "#").replace("♭", "b").strip()
+    if not key_name:
+        return ""
+    parts = key_name.split()
+    note = parts[0]
+    mode = parts[1].lower() if len(parts) > 1 else ""
+    return note + ("m" if mode.startswith("min") else "")
+
+
+def _parse_beatport_track(t):
+    artist_names = []
+    for a in t.get("artists") or []:
+        name = a.get("artist_name", "").strip() if isinstance(a, dict) else ""
+        if name and name not in artist_names:  # Beatport sometimes lists the same artist twice
+            artist_names.append(name)
+
+    base_title = (t.get("track_name") or "").strip()
+    mix_name = (t.get("mix_name") or "").strip()
+    # Beatport keeps the mix ("Extended Mix", "Fisher Rework") separate from
+    # the track name - put it back in brackets the way DJ libraries expect,
+    # unless the track name already includes it.
+    if mix_name and mix_name.lower() not in base_title.lower():
+        full_title = f"{base_title} ({mix_name})"
+    else:
+        full_title = base_title
+
+    # Genre first, sub-genre ('Dance', 'Peak Time' etc.) only as a fallback.
+    genre = (_beatport_name(t.get("genre"), "genre_name")
+             or _beatport_name(t.get("sub_genre"), "sub_genre_name", "genre_name"))
+
+    release_val = t.get("release")
+    release_dict = release_val if isinstance(release_val, dict) else {}
+
+    # Only the RELEASE artwork is real cover art. The track-level
+    # track_image_uri is a 1500x250 waveform PNG, so it's deliberately never
+    # used as a fallback - no cover is better than a waveform as a cover.
+    image_url = release_dict.get("release_image_dynamic_uri") or release_dict.get("release_image_uri") or ""
+    if image_url:
+        size = str(BEATPORT_COVER_SIZE)
+        image_url = image_url.replace("{w}", size).replace("{h}", size)
+        image_url = re.sub(r"/image_size/\d+x\d+/", f"/image_size/{size}x{size}/", image_url)
+        if image_url.startswith("//"):
+            image_url = "https:" + image_url
+
+    date = (t.get("publish_date") or t.get("release_date") or "")[:10]
+    bpm = t.get("bpm")
+    track_id = t.get("track_id")
+
+    return {
+        "title": full_title or "Unknown title",
+        "base_title": base_title,
+        "mix_name": mix_name,
+        "artists": ", ".join(artist_names) or "Unknown artist",
+        "artist_list": artist_names or ["Unknown artist"],
+        "label": _beatport_name(t.get("label"), "label_name"),
+        "genre": genre,
+        "release": _beatport_name(release_val, "release_name"),
+        "date": date,
+        "year": date[:4],
+        "bpm": str(round(bpm)) if isinstance(bpm, (int, float)) and bpm > 0 else "",
+        "key": beatport_key_to_tag(t.get("key_name") or ""),
+        "isrc": (t.get("isrc") or "").strip(),
+        "image_url": image_url,
+        "url": f"https://www.beatport.com/track/-/{track_id}" if track_id else "",
+    }
+
+
+def _fetch_beatport_tracks(query: str, dbg):
+    url = BEATPORT_SEARCH_URL.format(query=requests.utils.quote(query))
+    resp = requests.get(url, headers=BEATPORT_HEADERS, timeout=15)
+    dbg(f"GET {url} -> HTTP {resp.status_code}, {len(resp.text)} bytes")
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    script_tag = soup.find("script", id="__NEXT_DATA__")
+    if not script_tag or not script_tag.string:
+        dbg("No <script id=\"__NEXT_DATA__\"> tag found - Beatport's page structure may have changed.")
+        return []
+    try:
+        data = json.loads(script_tag.string)
+    except (json.JSONDecodeError, TypeError) as e:
+        dbg(f"JSON parse failed: {e}")
+        return []
+
+    track_list = _find_beatport_track_list(data)
+    if not track_list:
+        dbg("No track list found in the page JSON.")
+        return []
+    return track_list
+
+
+def score_beatport_result(artist: str, title: str, result) -> float:
+    """0..1 similarity between a local file's artist/title and a Beatport
+    result, using the same title+artist weighting as playlist matching,
+    plus a small bonus/penalty for the mix name so 'X (Extended Mix)' on
+    disk prefers Beatport's Extended over its Radio Edit or a remix."""
+    candidate = {
+        "norm_title": normalize(result["base_title"]),
+        "artist_set": split_artists(ARTIST_DISAMBIGUATOR_RE.sub("", result["artists"])),
+    }
+    target_artists = split_artists(ARTIST_DISAMBIGUATOR_RE.sub("", artist or ""))
+    if target_artists:
+        score = score_match(normalize(title), target_artists, candidate)
+    else:
+        # Nothing to compare artists against (untagged file with no
+        # "Artist - Title" filename). Title alone can't tell apart different
+        # songs with the same name, so cap it below BEATPORT_MIN_SCORE -
+        # the user has to pick the right one by hand.
+        score = min(best_ratio(normalize(title), candidate["norm_title"]), BEATPORT_MIN_SCORE - 0.05)
+
+    remix_words = ("remix", "rework", "bootleg", "vip", "edit", "dub")
+    local_mix = " ".join(m.strip("() ").lower() for m in MIX_SUFFIX_RE.findall(title or ""))
+    remote_mix = result["mix_name"].lower()
+    local_is_remix = any(w in local_mix for w in remix_words)
+    remote_is_remix = any(w in remote_mix for w in remix_words)
+    if remote_is_remix and not local_is_remix:
+        # File doesn't mention a remix/edit, so one is probably the wrong version.
+        score -= 0.1
+    if local_mix and remote_mix:
+        score += 0.1 * (difflib.SequenceMatcher(None, local_mix, remote_mix).ratio() - 0.5)
+    # Deliberately not clamped to 1.0 here - search_beatport sorts on the raw
+    # value so a matching mix name still breaks ties between perfect matches.
+    return max(0.0, score)
+
+
+def search_beatport(artist: str, title: str, max_results: int = 5, log=None):
+    """Searches Beatport and returns up to max_results result dicts, ranked
+    best-first by how well each matches the given artist/title (each dict
+    has a 'score' 0..1 - see score_beatport_result - plus 'title',
+    'artists', 'label', 'genre', 'release', 'date', 'year', 'bpm', 'key',
+    'isrc', 'image_url', 'url'). Beatport's own ordering is by popularity,
+    not closeness, so its first hit is often a different track entirely.
+    Returns [] if nothing was found or the page couldn't be parsed - callers
+    should treat that as "None found", not an error."""
+    if requests is None or BeautifulSoup is None:
+        raise RuntimeError("Missing dependency. Run: pip install requests beautifulsoup4")
+
+    def dbg(msg):
+        if log:
+            log(f"    [beatport debug] {msg}")
+
+    query = f"{artist} {title}".strip()
+    track_list = _fetch_beatport_tracks(query, dbg)
+    if not track_list:
+        # Retry without mix suffixes / feat. credits / punctuation, which
+        # sometimes stop Beatport's search matching at all.
+        clean_query = f"{normalize(artist)} {normalize(title)}".strip()
+        if clean_query and clean_query != query.lower():
+            track_list = _fetch_beatport_tracks(clean_query, dbg)
+
+    results = [_parse_beatport_track(t) for t in track_list if isinstance(t, dict)]
+    for r in results:
+        r["score"] = score_beatport_result(artist, title, r)
+    results.sort(key=lambda r: r["score"], reverse=True)
+    for r in results:
+        r["score"] = min(1.0, r["score"])
+    if results:
+        dbg(f"{len(track_list)} results, best match {results[0]['score']:.2f}: "
+            f"{results[0]['artists']} - {results[0]['title']}")
+    return results[:max_results]
+
+
+def sniff_image_mime(data):
+    """Identifies the image type from its bytes rather than trusting the
+    server's Content-Type header - a wrong mime in the cover tag makes
+    Rekordbox/Explorer show no artwork. Returns None if it isn't a
+    JPEG/PNG (e.g. an HTML error page), since players only reliably
+    support those two."""
+    if not data:
+        return None
+    if data[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    return None
+
+
+def _make_flac_picture(image_bytes, image_mime):
+    pic = Picture()
+    pic.data = image_bytes
+    pic.type = 3  # front cover
+    pic.mime = image_mime
+    pic.desc = "Cover"
+    return pic
+
+
+def _as_list(value):
+    """Tag values as a list - the artist field is already a list (one entry
+    per artist, written as separate tag values), everything else is a string."""
+    return list(value) if isinstance(value, list) else [value]
+
+
+def _set_id3_tags(tags, fields, image_bytes, image_mime):
+    frame_map = [
+        ("title", TIT2), ("artist", TPE1), ("album", TALB), ("genre", TCON),
+        ("label", TPUB), ("year", TDRC), ("bpm", TBPM), ("key", TKEY), ("isrc", TSRC),
+    ]
+    for field, frame_cls in frame_map:
+        value = fields.get(field)
+        if value:
+            tags.setall(frame_cls.__name__, [frame_cls(encoding=3, text=_as_list(value))])
+    if image_bytes:
+        tags.delall("APIC")
+        tags.add(APIC(encoding=3, mime=image_mime, type=3, desc="Cover", data=image_bytes))
+
+
+def _set_vorbis_tags(tags, fields):
+    """FLAC / Ogg / Opus comments. Label and key get written under both
+    common names, since different DJ apps read different ones."""
+    key_map = {
+        "title": ["title"], "artist": ["artist"], "album": ["album"], "genre": ["genre"],
+        "label": ["organization", "label"], "date": ["date"], "bpm": ["bpm"],
+        "key": ["initialkey", "key"], "isrc": ["isrc"],
+    }
+    for field, keys in key_map.items():
+        value = fields.get(field)
+        if value:
+            for k in keys:
+                tags[k] = _as_list(value)
+
+
+def embed_full_metadata(file_path: Path, fields: dict, image_bytes, image_mime: str):
+    """Writes the text tags in `fields` (title, artist, album, genre, label,
+    date, year, bpm, key, isrc - empty/missing values leave that tag alone;
+    artist is a list, saved as one tag value per artist)
+    plus front-cover art if image_bytes is given. Format-specific, since
+    cover art isn't a simple key=value tag: ID3 APIC for mp3/wav/aiff,
+    Picture block for flac, METADATA_BLOCK_PICTURE for ogg/opus, covr atom
+    for m4a/mp4. Other formats get text tags only. Raises on failure so the
+    caller can report it rather than claiming success.
+
+    Returns True if cover art was embedded."""
+    if MutagenFile is None:
+        raise RuntimeError("mutagen is not installed")
+
+    suffix = file_path.suffix.lower()
+    audio = MutagenFile(file_path)
+    if audio is None:
+        raise RuntimeError("unrecognised audio file")
+
+    if suffix in (".mp3", ".wav", ".aiff", ".aif"):
+        if audio.tags is None:
+            audio.add_tags()
+        _set_id3_tags(audio.tags, fields, image_bytes, image_mime)
+        # ID3v2.3 rather than mutagen's default v2.4 - Rekordbox, Windows
+        # Explorer and older players can miss cover art / genre in v2.4.
+        # v23_sep=None keeps multiple artists as separate null-separated
+        # values instead of mutagen's default of joining them with "/".
+        audio.tags.update_to_v23()
+        audio.save(v2_version=3, v23_sep=None)
+        return bool(image_bytes)
+
+    if suffix == ".flac":
+        if audio.tags is None:
+            audio.add_tags()
+        _set_vorbis_tags(audio.tags, fields)
+        if image_bytes:
+            audio.clear_pictures()
+            audio.add_picture(_make_flac_picture(image_bytes, image_mime))
+        audio.save()
+        return bool(image_bytes)
+
+    if suffix in (".ogg", ".opus"):
+        _set_vorbis_tags(audio.tags, fields)
+        if image_bytes:
+            picture_data = _make_flac_picture(image_bytes, image_mime).write()
+            audio.tags["metadata_block_picture"] = [base64.b64encode(picture_data).decode("ascii")]
+        audio.save()
+        return bool(image_bytes)
+
+    if suffix in (".m4a", ".mp4"):
+        if audio.tags is None:
+            audio.add_tags()
+        atom_map = {"title": "\xa9nam", "artist": "\xa9ART", "album": "\xa9alb",
+                    "genre": "\xa9gen", "date": "\xa9day"}
+        for field, atom in atom_map.items():
+            if fields.get(field):
+                audio.tags[atom] = _as_list(fields[field])
+        if fields.get("bpm"):
+            audio.tags["tmpo"] = [int(fields["bpm"])]
+        freeform_map = {"label": "LABEL", "key": "initialkey", "isrc": "ISRC"}
+        for field, name in freeform_map.items():
+            if fields.get(field):
+                audio.tags[f"----:com.apple.iTunes:{name}"] = [MP4FreeForm(fields[field].encode("utf-8"))]
+        if image_bytes:
+            cover_format = MP4Cover.FORMAT_PNG if image_mime == "image/png" else MP4Cover.FORMAT_JPEG
+            audio.tags["covr"] = [MP4Cover(image_bytes, imageformat=cover_format)]
+        audio.save()
+        return bool(image_bytes)
+
+    # No standard cover-art support in this format - text tags only.
+    easy_audio = MutagenFile(file_path, easy=True)
+    if easy_audio is None:
+        raise RuntimeError("unrecognised audio file")
+    if easy_audio.tags is None:
+        easy_audio.add_tags()
+    for field in ("title", "artist", "album", "genre"):
+        if fields.get(field):
+            easy_audio[field] = _as_list(fields[field])
+    easy_audio.save()
+    return False
+
+
+def download_image(url: str):
+    """Returns (bytes, mime_type) or (None, None) on failure or if the
+    response isn't a JPEG/PNG image."""
+    if requests is None or not url:
+        return None, None
+    try:
+        resp = requests.get(url, headers=BEATPORT_HEADERS, timeout=15)
+        resp.raise_for_status()
+    except Exception:
+        return None, None
+    mime = sniff_image_mime(resp.content)
+    if not mime:
+        return None, None
+    return resp.content, mime
+
+
 # ---------- Small shared GUI helpers ----------
 
 def browse_file_into(entry, filetypes, title):
@@ -899,7 +1332,7 @@ class DownloadTab(tk.Frame):
 
         except Exception as e:
             self.log(f"ERROR: {e}")
-            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            self.after(0, lambda err=e: messagebox.showerror("Error", str(err)))
         finally:
             self.after(0, self.progress.stop)
             self.after(0, lambda: self.run_button.configure(state="normal"))
@@ -1210,7 +1643,7 @@ class PlaylistTab(tk.Frame):
 
         except Exception as e:
             self.log(f"ERROR: {e}")
-            self.after(0, lambda: messagebox.showerror("Error", str(e)))
+            self.after(0, lambda err=e: messagebox.showerror("Error", str(err)))
         finally:
             self.after(0, self.progress.stop)
             self.after(0, lambda: self.run_button.configure(state="normal"))
@@ -1601,13 +2034,372 @@ class YouTubeResultsWindow(tk.Toplevel):
                 self.after(0, self.destroy)
             except Exception as e:
                 self.log(f"  Download failed: {e}")
-                self.after(0, lambda: self.status_label.configure(text=f"Failed: {e}"))
+                self.after(0, lambda err=e: self.status_label.configure(text=f"Failed: {err}"))
                 self.after(0, lambda: self.download_btn.configure(state="normal"))
 
         threading.Thread(target=do_download, daemon=True).start()
 
 
-# ---------- Tab 3: Settings ----------
+# ---------- Tab 3: Metadata Editor ----------
+
+class MetadataEditorTab(tk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        style_frame(self)
+        pad = {"padx": 10, "pady": 6}
+
+        heading = tk.Label(self, text="Beatport Cover & Genre Lookup", font=("", 11, "bold"))
+        style_label(heading)
+        heading.pack(anchor="w", padx=10, pady=(10, 4))
+
+        note = tk.Label(
+            self,
+            text="Works best with EDM/electronic tracks - Beatport's catalog is dance-music "
+                 "focused, so other genres will often come back \"None found\". Nothing is written "
+                 "to your files until you approve it per track in the review window.",
+            justify="left", wraplength=640
+        )
+        style_label(note, subtle=True)
+        note.pack(anchor="w", padx=10, pady=(0, 10))
+
+        self.folder_entry = make_path_row(
+            self, "Music folder to scan:",
+            lambda e: browse_folder_into(e, "Select a folder of music to look up"),
+            pad
+        )
+
+        run_frame = tk.Frame(self); style_frame(run_frame)
+        run_frame.pack(fill="x", **pad)
+        self.run_button = tk.Button(run_frame, text="Scan & Search Beatport", command=self.run_clicked, width=22)
+        style_button(self.run_button)
+        self.run_button.pack(side="left")
+        self.progress = ttk.Progressbar(run_frame, mode="indeterminate")
+        self.progress.pack(side="left", fill="x", expand=True, padx=(10, 0))
+
+        log_label = tk.Label(self, text="Log:"); style_label(log_label)
+        log_label.pack(anchor="w", **pad)
+        self.log_box = scrolledtext.ScrolledText(self, height=16, state="disabled", wrap="word")
+        style_scrolledtext(self.log_box)
+        self.log_box.pack(fill="both", expand=True, **pad)
+
+        if not MutagenFile:
+            self.log("WARNING: 'mutagen' is not installed. Run: pip install mutagen")
+        if requests is None or BeautifulSoup is None:
+            self.log("NOTE: 'requests' and/or 'beautifulsoup4' are not installed - Beatport lookup "
+                      "won't work until you run: pip install requests beautifulsoup4")
+
+    def log(self, message: str):
+        def append():
+            self.log_box.configure(state="normal")
+            self.log_box.insert(tk.END, message + "\n")
+            self.log_box.see(tk.END)
+            self.log_box.configure(state="disabled")
+        self.after(0, append)
+
+    def run_clicked(self):
+        folder = self.folder_entry.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showerror("Missing info", "Choose a valid music folder.")
+            return
+        if not MutagenFile:
+            messagebox.showerror("Missing dependency", "Install requirements first:\npip install mutagen")
+            return
+        if requests is None or BeautifulSoup is None:
+            messagebox.showerror("Missing dependency",
+                                  "Install requirements first:\npip install requests beautifulsoup4")
+            return
+
+        self.run_button.configure(state="disabled")
+        self.progress.start(10)
+        thread = threading.Thread(target=self.worker, args=(folder,), daemon=True)
+        thread.start()
+
+    def worker(self, folder):
+        try:
+            folder_path = Path(folder)
+            self.log(f"Scanning {folder_path} for audio files...")
+            files = [p for p in folder_path.rglob("*") if p.suffix.lower() in AUDIO_EXTENSIONS]
+            self.log(f"Found {len(files)} audio files.")
+
+            items = []
+            for i, filepath in enumerate(files, 1):
+                existing = read_existing_tags(filepath)
+                title, artist = existing["title"], existing["artist"]
+                self.log(f"[{i}/{len(files)}] Searching Beatport: {artist} - {title}")
+                try:
+                    results = search_beatport(artist, title, log=self.log)
+                except Exception as e:
+                    self.log(f"  Search failed: {e}")
+                    results = []
+                items.append({
+                    "path": filepath, "title": title, "artist": artist,
+                    "existing_album": existing["album"], "existing_genre": existing["genre"],
+                    "results": results,
+                })
+
+            found = sum(1 for it in items if it["results"])
+            self.log(f"\nDone searching. {found}/{len(items)} tracks got at least one Beatport match.")
+            self.after(0, lambda: MetadataReviewWindow(self, items, self.log))
+
+        except Exception as e:
+            self.log(f"ERROR: {e}")
+            self.after(0, lambda err=e: messagebox.showerror("Error", str(err)))
+        finally:
+            self.after(0, self.progress.stop)
+            self.after(0, lambda: self.run_button.configure(state="normal"))
+
+
+class MetadataReviewWindow(tk.Toplevel):
+    """Lists every scanned file with its Beatport matches, ranked by how
+    closely they match the file's own title/artist. Each row has a picker
+    with the top candidates plus "Don't change this file"; confident
+    matches are pre-selected, weak ones default to "Don't change" so
+    Apply All can't write another song's cover/genre into a file. Apply
+    writes the selected match's tags + cover art into that file."""
+
+    SKIP_CHOICE = "Don't change this file"
+
+    def __init__(self, parent, items, log):
+        super().__init__(parent)
+        self.title("TrackMatch - Metadata Review")
+        self.geometry("880x660")
+        style_window(self)
+        set_window_icon(self, ICON_PATH)
+        enable_dark_titlebar(self)
+        add_credit_footer(self)
+
+        self.items = items
+        self.log = log
+        self.status_labels = {}
+        self.apply_buttons = {}
+        self.detail_labels = {}
+        self.detail_kinds = {}    # idx -> 'found'/'missing', read by the detail label's theme closure
+        self.choice_vars = {}     # idx -> StringVar holding the picker's label
+        self.choice_lookup = {}   # idx -> {picker label: result dict}
+
+        found = sum(1 for it in items if it["results"])
+        confident = sum(1 for it in items if it["results"] and it["results"][0]["score"] >= BEATPORT_MIN_SCORE)
+        header = tk.Label(
+            self,
+            text=f"{found}/{len(items)} tracks found Beatport results - {confident} confident matches are "
+                 f"pre-selected. Weak matches (flagged below) default to \"{self.SKIP_CHOICE}\": pick the "
+                 f"right result from the list if it's there. Apply writes Title (incl. mix), Artist, Album, "
+                 f"Genre, Label, Year, BPM, Key, ISRC + cover art - Beatport's data is used where available, "
+                 f"otherwise the file's existing tag is kept. Nothing happens until you click Apply (or Apply All).",
+            justify="left", wraplength=840
+        )
+        style_label(header, subtle=True)
+        header.pack(anchor="w", padx=10, pady=(10, 0))
+
+        canvas = tk.Canvas(self, borderwidth=0)
+        style_canvas(canvas)
+        scroll_frame = tk.Frame(canvas); style_frame(scroll_frame)
+        scrollbar = tk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        scrollbar.pack(side="right", fill="y")
+        canvas.pack(side="top", fill="both", expand=True, padx=10, pady=10)
+        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
+        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind_all("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+
+        for i, item in enumerate(items):
+            row = tk.Frame(scroll_frame, relief="groove", borderwidth=1, highlightthickness=1)
+            style_row_frame(row)
+            row.pack(fill="x", pady=4, padx=2)
+
+            title_label = tk.Label(row, text=f"{item['artist']} - {item['title']}    [{item['path'].name}]",
+                                   justify="left", anchor="w", wraplength=820)
+            style_label(title_label)
+            title_label.pack(fill="x", padx=6, pady=(4, 0))
+
+            detail_label = tk.Label(row, text="", justify="left", anchor="w", wraplength=820)
+            self.detail_kinds[i] = "found"
+            register(lambda lbl=detail_label, idx=i: lbl.configure(
+                bg=THEME["BG"], fg=THEME["FOUND_FG" if self.detail_kinds[idx] == "found" else "MISSING_FG"]))
+            detail_label.pack(fill="x", padx=6, pady=(0, 2))
+            self.detail_labels[i] = detail_label
+
+            control_frame = tk.Frame(row); style_frame(control_frame)
+            control_frame.pack(fill="x", padx=6, pady=(0, 6))
+
+            lookup = {}
+            for n, r in enumerate(item["results"], 1):
+                lookup[f"{n}. {r['artists']} - {r['title']}  ({r['score']:.0%})"] = r
+            self.choice_lookup[i] = lookup
+
+            best = item["results"][0] if item["results"] else None
+            if best and best["score"] >= BEATPORT_MIN_SCORE:
+                initial = next(iter(lookup))
+            else:
+                initial = self.SKIP_CHOICE
+            var = tk.StringVar(value=initial)
+            self.choice_vars[i] = var
+
+            apply_btn = tk.Button(control_frame, text="Apply", command=lambda idx=i: self.apply_item(idx))
+            style_button(apply_btn)
+            apply_btn.pack(side="left")
+            self.apply_buttons[i] = apply_btn
+
+            if lookup:
+                picker = tk.OptionMenu(control_frame, var, *lookup.keys(), self.SKIP_CHOICE,
+                                       command=lambda _value, idx=i: self.refresh_row(idx))
+                style_optionmenu(picker, picker["menu"])
+                picker.pack(side="left", fill="x", expand=True, padx=(6, 0))
+
+            status_label = tk.Label(row, text="", justify="left", anchor="w")
+            style_label(status_label, subtle=True)
+            status_label.pack(fill="x", padx=6, pady=(0, 4))
+            self.status_labels[i] = status_label
+
+            self.refresh_row(i)
+
+        bottom = tk.Frame(self); style_frame(bottom)
+        bottom.pack(fill="x", padx=10, pady=10)
+        close_btn = tk.Button(bottom, text="Close", command=self.destroy, width=12)
+        style_button(close_btn)
+        close_btn.pack(side="right")
+        self.apply_all_btn = tk.Button(bottom, text="Apply All Selected", command=self.apply_all)
+        style_button(self.apply_all_btn)
+        self.apply_all_btn.pack(side="right", padx=(0, 6))
+        if found == 0:
+            self.apply_all_btn.configure(state="disabled")
+
+    def selected_result(self, idx):
+        """The Beatport result currently picked for row idx, or None for
+        "Don't change". Must be called on the Tk main thread."""
+        return self.choice_lookup[idx].get(self.choice_vars[idx].get())
+
+    def refresh_row(self, idx):
+        """Updates the detail line and Apply button to match the picker."""
+        item = self.items[idx]
+        chosen = self.selected_result(idx)
+        label = self.detail_labels[idx]
+
+        if not item["results"]:
+            label.configure(text="None found on Beatport")
+            self.set_detail_kind(idx, "missing")
+            self.apply_buttons[idx].configure(state="disabled")
+            return
+
+        if chosen is None:
+            best = item["results"][0]
+            if best["score"] < BEATPORT_MIN_SCORE:
+                text = (f"Weak match only - best was {best['score']:.0%} similar. Check the list, or leave "
+                        f"this file unchanged.")
+            else:
+                text = "Leaving this file unchanged."
+            label.configure(text=text)
+            self.set_detail_kind(idx, "missing")
+            self.apply_buttons[idx].configure(state="disabled")
+            return
+
+        fields = self.resolve_fields(item, chosen)
+        parts = [
+            f"Will write: \"{', '.join(fields['artist'])} - {fields['title']}\"",
+            f"Album: {fields['album'] or '(none)'}",
+            f"Genre: {fields['genre'] or '(none)'}",
+        ]
+        for name, key in (("Label", "label"), ("Year", "year"), ("BPM", "bpm"), ("Key", "key")):
+            if fields.get(key):
+                parts.append(f"{name}: {fields[key]}")
+        parts.append("cover art" if chosen.get("image_url") else "no cover art available")
+        label.configure(text="  |  ".join(parts))
+        self.set_detail_kind(idx, "found" if chosen["score"] >= BEATPORT_MIN_SCORE else "missing")
+        self.apply_buttons[idx].configure(state="normal")
+
+    def set_detail_kind(self, idx, kind):
+        self.detail_kinds[idx] = kind
+        self.detail_labels[idx].configure(fg=THEME["FOUND_FG" if kind == "found" else "MISSING_FG"])
+
+    def resolve_fields(self, item, best):
+        """Beatport's value wins for each field when it has one; otherwise
+        keep whatever was already in the file, so applying a match never
+        blanks out good existing data. Label/date/BPM/key/ISRC are
+        Beatport-only - an empty value just leaves that tag untouched."""
+        return {
+            "title": best.get("title") or item["title"],
+            "artist": best.get("artist_list") or ([item["artist"]] if item["artist"] else []),
+            "album": best.get("release") or item.get("existing_album", ""),
+            "genre": best.get("genre") or item.get("existing_genre", ""),
+            "label": best.get("label", ""),
+            "date": best.get("date", ""),
+            "year": best.get("year", ""),
+            "bpm": best.get("bpm", ""),
+            "key": best.get("key", ""),
+            "isrc": best.get("isrc", ""),
+        }
+
+    def set_row_status(self, idx, text):
+        def update():
+            if idx in self.status_labels:
+                self.status_labels[idx].configure(text=text)
+        self.after(0, update)
+
+    def write_item(self, idx, chosen):
+        """Downloads the cover and writes all tags for one row. Runs on a
+        background thread; returns True/False for success."""
+        item = self.items[idx]
+        self.set_row_status(idx, "Downloading cover art and updating tags...")
+        try:
+            fields = self.resolve_fields(item, chosen)
+            image_bytes, image_mime = download_image(chosen.get("image_url", ""))
+            if chosen.get("image_url") and not image_bytes:
+                self.log(f"  Couldn't download cover art for \"{item['path'].name}\" - writing text tags only.")
+            cover_written = embed_full_metadata(item["path"], fields, image_bytes, image_mime)
+            if cover_written:
+                self.set_row_status(idx, "Applied - full metadata + cover art updated.")
+            elif image_bytes:
+                self.set_row_status(idx, f"Applied - metadata updated (cover art isn't supported "
+                                         f"for {item['path'].suffix} files).")
+            else:
+                self.set_row_status(idx, "Applied - metadata updated (no cover image was available).")
+            self.log(f"  Updated: {item['path'].name}")
+            return True
+        except Exception as e:
+            self.log(f"  Could not write metadata to \"{item['path'].name}\": {e}")
+            self.set_row_status(idx, f"Failed: {e}")
+            self.after(0, lambda: self.apply_buttons[idx].configure(state="normal"))
+            return False
+
+    def apply_item(self, idx):
+        chosen = self.selected_result(idx)
+        if not chosen:
+            return
+        self.apply_buttons[idx].configure(state="disabled")
+        threading.Thread(target=self.write_item, args=(idx, chosen), daemon=True).start()
+
+    def apply_all(self):
+        # Read every picker here on the main thread - Tk variables aren't
+        # safe to touch from the worker thread.
+        jobs = [(i, self.selected_result(i)) for i in range(len(self.items))]
+        jobs = [(i, chosen) for i, chosen in jobs if chosen and str(self.apply_buttons[i]["state"]) == "normal"]
+        if not jobs:
+            messagebox.showinfo("Nothing to apply", "No rows have a Beatport match selected.", parent=self)
+            return
+
+        self.apply_all_btn.configure(state="disabled")
+        for i, _ in jobs:
+            self.apply_buttons[i].configure(state="disabled")
+        self.log(f"\nApplying Beatport metadata to {len(jobs)} tracks...")
+
+        def do_all():
+            applied, failed = 0, 0
+            for i, chosen in jobs:
+                if self.write_item(i, chosen):
+                    applied += 1
+                else:
+                    failed += 1
+            self.log(f"\nApply All complete: {applied} updated, {failed} failed.")
+            self.after(0, lambda: self.apply_all_btn.configure(state="normal"))
+            self.after(0, lambda: messagebox.showinfo(
+                "Apply All complete", f"{applied} track(s) updated.\n{failed} failed.", parent=self
+            ))
+
+        threading.Thread(target=do_all, daemon=True).start()
+
+
+# ---------- Tab 4: Settings ----------
 
 class SettingsTab(tk.Frame):
     def __init__(self, parent):
@@ -1700,10 +2492,12 @@ class App(tk.Tk):
 
         download_tab = DownloadTab(notebook)
         playlist_tab = PlaylistTab(notebook)
+        metadata_tab = MetadataEditorTab(notebook)
         settings_tab = SettingsTab(notebook)
 
         notebook.add(download_tab, text="Download Missing Tracks")
         notebook.add(playlist_tab, text="Create Playlist")
+        notebook.add(metadata_tab, text="Metadata Editor")
         notebook.add(settings_tab, text="Settings")
 
 

@@ -1,2 +1,4 @@
 mutagen
 yt-dlp
+requests
+beautifulsoup4
