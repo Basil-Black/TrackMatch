@@ -12,7 +12,7 @@ Match a playlist CSV against your music folder and either:
 - Generate an `.m3u8` with paths relative to the playlist file itself (portable across USB drives / different computers), or
 - Copy the matched files into a folder
 
-Every track is shown for manual review — worst matches first — before anything is written to disk.
+Every track is shown for manual review  (worst matches first) before anything is written to disk.
 
 **Tab 3  Settings**
 Toggle dark/light mode for the whole app, and optionally use browser cookies (Chrome, Firefox, etc.) to get past YouTube's age-restriction checks when downloading.
@@ -54,4 +54,4 @@ This tool uses `yt-dlp` to fetch audio from YouTube for tracks missing from your
 
 ## License
 
-MIT (or your choice)
+No license as of yet
