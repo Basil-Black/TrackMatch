@@ -94,7 +94,7 @@ except ImportError:
 
 try:
     from send2trash import send2trash
-except ImportError:
+except Exception:  # not installed, or failed to set itself up on this system - the app must still start
     send2trash = None
 
 TRASH_NAME = "Recycle Bin" if sys.platform == "win32" else "Trash"
@@ -436,7 +436,7 @@ def _notify_setting_listeners():
 
 
 def settings_file_path() -> Path:
-    return app_base_dir() / "trackmatch_settings.json"
+    return user_data_dir() / "trackmatch_settings.json"
 
 
 def load_settings():
@@ -759,6 +759,57 @@ def app_base_dir() -> Path:
     return Path(__file__).parent
 
 
+def _system_user_dir() -> Path:
+    """The usual per-user app data folder for this system."""
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA")
+        return (Path(local) if local else Path.home() / "AppData" / "Local") / "TrackMatch"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "TrackMatch"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".local" / "share") / "TrackMatch"
+
+
+def _is_writable_dir(folder: Path) -> bool:
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        probe = folder / f".trackmatch_write_test_{os.getpid()}"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+_DATA_DIR = []
+
+
+def user_data_dir() -> Path:
+    """Where TrackMatch keeps its own files - settings, saved lookups, logs.
+    Normally right next to the app, so a TrackMatch folder is portable. A
+    macOS .app bundle mustn't be written into, so there it's
+    ~/Library/Application Support/TrackMatch; and if the app's folder can't
+    be written to (e.g. a protected install location), the system's usual
+    per-user folder."""
+    if not _DATA_DIR:
+        if getattr(sys, "frozen", False) and sys.platform == "darwin":
+            candidates = [_system_user_dir()]
+        else:
+            candidates = [app_base_dir(), _system_user_dir()]
+        chosen = next((c for c in candidates if _is_writable_dir(c)), candidates[-1])
+        _DATA_DIR.append(chosen)
+    return _DATA_DIR[0]
+
+
+def bundled_file(name: str) -> Path:
+    """A file shipped with the app (e.g. icon.png): inside the PyInstaller
+    bundle if it was added there, otherwise next to the app."""
+    bundle = getattr(sys, "_MEIPASS", None)
+    if bundle and (Path(bundle) / name).is_file():
+        return Path(bundle) / name
+    return app_base_dir() / name
+
+
 # ---------- Session log files ----------
 
 LOG_RETENTION_DAYS = 30
@@ -774,7 +825,7 @@ LOG_SOURCES = {
 class SessionLog:
     """Everything the tabs log, plus full details of any unexpected error,
     written to one file per app session in a "logs" folder next to the app
-    (or %LOCALAPPDATA%\\TrackMatch\\logs if that isn't writable). The file is
+    (see user_data_dir), or the system's per-user folder if that isn't writable. The file is
     opened on first use; session files older than LOG_RETENTION_DAYS are
     deleted then."""
 
@@ -785,9 +836,8 @@ class SessionLog:
         self.path = None
 
     def _candidate_folders(self):
-        yield app_base_dir() / "logs"
-        local = os.environ.get("LOCALAPPDATA")
-        yield (Path(local) if local else Path.home()) / "TrackMatch" / "logs"
+        yield user_data_dir() / "logs"
+        yield _system_user_dir() / "logs"
 
     def _open(self):
         if self._file is not None:
@@ -951,11 +1001,10 @@ def set_window_icon(window, icon_path):
     """Sets a custom title-bar/taskbar icon if ICON_PATH points at a real file."""
     if not icon_path:
         return
-    path = Path(icon_path)
-    if not path.is_absolute():
-        path = app_base_dir() / path
-    if path.suffix.lower() == ".ico" and sys.platform != "win32":
-        path = path.with_suffix(".png")  # macOS / Linux can't use .ico - icon.png sits next to it
+    name = Path(icon_path)
+    if name.suffix.lower() == ".ico" and sys.platform != "win32":
+        name = name.with_suffix(".png")  # macOS / Linux can't use .ico - icon.png is shipped alongside it
+    path = name if name.is_absolute() else bundled_file(str(name))
     if not path.is_file():
         return
     try:
@@ -5740,10 +5789,14 @@ class LookupCache:
     again) plus the source and minimum-match setting (which change what a
     lookup returns)."""
 
-    def __init__(self, path: Path):
-        self.path = path
+    def __init__(self, filename: str):
+        self.filename = filename
         self._lock = threading.Lock()
         self._data = None
+
+    @property
+    def path(self) -> Path:
+        return user_data_dir() / self.filename
 
     def _load(self):
         if self._data is not None:
@@ -5797,7 +5850,7 @@ class LookupCache:
                 pass
 
 
-LOOKUP_CACHE = LookupCache(app_base_dir() / "trackmatch_lookup_cache.jsonl")
+LOOKUP_CACHE = LookupCache("trackmatch_lookup_cache.jsonl")
 
 
 class ThemedMessages:
@@ -6577,7 +6630,7 @@ class SettingsTab(tk.Frame):
         self.show_logs_var = tk.BooleanVar(value=SHOW_LOG_PANELS)
         ThemedCheckbutton(logs_row, text="Show log panels in each tab", variable=self.show_logs_var,
                           command=lambda: set_show_log_panels(self.show_logs_var.get())).pack(side="left")
-        info_button(logs_row, f"Every session is logged to its own file in a \"logs\" folder next to TrackMatch - "
+        info_button(logs_row, f"Every session is logged to its own file in TrackMatch's \"logs\" folder - "
                               f"one file each time you open the app, kept for {LOG_RETENTION_DAYS} days - whether "
                               f"or not the panels are shown. Handy if something goes wrong.", "Logs"
                     ).pack(side="left", padx=(4, 0))

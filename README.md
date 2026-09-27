@@ -81,7 +81,7 @@ The app is built and tested on Windows. It is written to work on macOS and Linux
 
 ## Where TrackMatch keeps its files
 
-Next to `TrackMatch.exe` (or `trackmatch.py`):
+Next to `TrackMatch.exe` (or `trackmatch.py`), so a TrackMatch folder is portable. The Mac app uses `~/Library/Application Support/TrackMatch` instead, and if the app's folder can't be written to, TrackMatch uses your system's usual per-user folder.
 - `trackmatch_settings.json`: your settings
 - `trackmatch_lookup_cache.jsonl`: saved lookups from Large library mode (clear them in Settings)
 - `logs/`: one log file per session, kept for 30 days (open it from Settings). Useful when reporting a problem

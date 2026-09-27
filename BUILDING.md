@@ -100,14 +100,16 @@ python3 -m venv .venv
 ```bash
 .venv/bin/python trackmatch.py
 ```
-Next time, just repeat steps 4 and 6. **Running from source like this is the recommended way on Mac for now.**
+Next time, just repeat steps 4 and 6.
 
-### 7. Build a Mac app (optional, experimental)
+### 7. Build a Mac app (optional)
 ```bash
 .venv/bin/python -m pip install pyinstaller pillow
-.venv/bin/python -m PyInstaller --windowed --icon=icon.png --name TrackMatch trackmatch.py
+.venv/bin/python -m PyInstaller --windowed --icon=icon.png --add-data "icon.png:." --name TrackMatch trackmatch.py
 ```
-The app appears in the **`dist`** folder as `TrackMatch.app`. Because it isn't signed by Apple, the first time you open it, **right-click it > Open**, then click **Open** (or allow it in System Settings > Privacy & Security). The Mac app build hasn't been tested yet, so please report anything that goes wrong.
+The app appears in the **`dist`** folder as `TrackMatch.app` - drag it into your Applications folder. Because it isn't signed by Apple, the first time you open it, **right-click it > Open**, then click **Open** (or allow it in System Settings > Privacy & Security).
+
+The Mac app keeps your settings, saved lookups and logs in `~/Library/Application Support/TrackMatch`, so replacing the app with a newer version keeps them. The Mac build is new, so please report anything that goes wrong.
 
 ---
 
@@ -143,15 +145,16 @@ python3 -m venv .venv
 ### 6. Build a Linux app (optional)
 ```bash
 .venv/bin/python -m pip install pyinstaller
-.venv/bin/python -m PyInstaller --onefile --windowed --name TrackMatch trackmatch.py
+.venv/bin/python -m PyInstaller --onefile --windowed --add-data "icon.png:." --name TrackMatch trackmatch.py
 ```
-Your app appears in the **`dist`** folder as `TrackMatch`. Copy `icon.png` next to it, then run it by double-clicking or with `./TrackMatch`. The Linux build hasn't been tested yet, so please report anything that goes wrong.
+Your app appears in the **`dist`** folder as `TrackMatch`. Run it by double-clicking or with `./TrackMatch`. The Linux build hasn't been tested yet, so please report anything that goes wrong.
 
 ---
 
 ## Updating to a newer version
 
-- **Ready-made app:** download the new zip and extract it over the old folder (or into a new one). To keep your settings, copy `trackmatch_settings.json` from the old folder into the new one.
+- **Ready-made app (Windows):** download the new zip and extract it over the old folder (or into a new one). To keep your settings, copy `trackmatch_settings.json` from the old folder into the new one.
+- **Mac app:** just replace `TrackMatch.app` - your settings are kept in `~/Library/Application Support/TrackMatch`.
 - **From source:** download the new source zip, extract it, and copy your old `.venv` folder and `trackmatch_settings.json` across (or just repeat the setup step). Then run `pip install -r requirements.txt` again in case anything new is needed:
   - Windows: `.venv\Scripts\python -m pip install -r requirements.txt`
   - Mac / Linux: `.venv/bin/python -m pip install -r requirements.txt`
