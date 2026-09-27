@@ -18,6 +18,15 @@ trackmatch_settings.json
 .idea/
 .cache
 
+# Claude Code instructions (local only)
+CLAUDE.md
+
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Saved Metadata Editor lookups (Large Library Mode)
+trackmatch_lookup_cache.jsonl
+
+# Session log files
+logs/
