@@ -51,7 +51,9 @@ Paste a link, browse to a file, or paste a list of songs. No accounts or API key
 
 ## Requirements
 
-**Prebuilt app (Windows):** download the latest release, extract the zip and run `TrackMatch.exe`. Keep `icon.ico` and `icon.png` next to it.
+**New to this?** [BUILDING.md](BUILDING.md) walks through everything step by step for Windows, macOS and Linux, including installing Python and ffmpeg.
+
+**Prebuilt app (Windows):** download the latest release, extract the zip and run `TrackMatch.exe`. Keep `icon.ico` and `icon.png` next to it. If Windows shows "Windows protected your PC", click **More info** > **Run anyway** (this appears for any app that isn't signed with a paid certificate).
 
 **ffmpeg** is needed for downloading and converting (matching and playlists work without it):
 - Windows: `winget install ffmpeg`
@@ -86,12 +88,15 @@ Next to `TrackMatch.exe` (or `trackmatch.py`):
 
 ## Building the app yourself
 
+Full beginner steps for each system are in [BUILDING.md](BUILDING.md). The short version, from the TrackMatch folder:
+
 ```bash
-pip install pyinstaller
-python -m PyInstaller --onefile --windowed --icon=icon.ico --name "TrackMatch" trackmatch.py
+python -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt pyinstaller          # Windows: .venv\Scripts\python
+.venv/bin/python -m PyInstaller --onefile --windowed --icon=icon.ico --name TrackMatch trackmatch.py
 ```
 
-Put `icon.ico` and `icon.png` next to the built app so the window icon loads. PyInstaller builds for the system it runs on, so build on macOS or Linux to get an app for those.
+The app appears in `dist/`. Put `icon.ico` and `icon.png` next to it so the window icon loads. PyInstaller builds for the system it runs on, so build on macOS or Linux to get an app for those.
 
 ## A note on YouTube downloads
 

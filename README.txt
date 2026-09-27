@@ -22,7 +22,13 @@ GETTING STARTED
      Linux:   sudo apt install ffmpeg
    Then restart TrackMatch so it picks it up.
 2. Run TrackMatch.exe. Keep icon.ico and icon.png in the same folder.
+   The first time, Windows may show "Windows protected your PC" - this
+   appears for any app that isn't signed with a paid certificate. Click
+   "More info", then "Run anyway".
 3. Pick a tab below and go.
+
+Mac or Linux, or want to build it yourself? See BUILDING.md on the
+TrackMatch GitHub page for simple step-by-step instructions.
 
 
 PLAYLISTS YOU CAN USE
