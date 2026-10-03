@@ -66,6 +66,7 @@ import webbrowser
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 from tkinter import colorchooser, filedialog, ttk
 from tkinter import font as tkfont
 
@@ -201,6 +202,7 @@ LARGE_LIBRARY_MODE = False
 # (mutated in place, remembered in the settings file).
 LIBRARY_INCLUDE = {"other_genres": True, "unknown_genre": True, "unknown_year": True, "unknown_bpm": True}
 SHOW_LOG_PANELS = False  # the tabs' log boxes; logs are always written to files either way
+COVER_FALLBACK = True    # look a cover up on iTunes when the matched source's cover can't be downloaded
 ACCENT_PRESETS = {
     "Purple": "#8b5cf6", "Blue": "#3b82f6", "Teal": "#14b8a6", "Green": "#22c55e",
     "Orange": "#f97316", "Pink": "#ec4899", "Red": "#ef4444",
@@ -211,12 +213,30 @@ SETTING_LISTENERS = []  # zero-arg callables run when a setting is changed from 
 THEMED_WIDGETS = []  # list of zero-arg callables that reapply current THEME colors
 
 
+_NEXT_PRUNE = [1000]
+
+
 def register(apply_fn):
     """Runs apply_fn now and remembers it so retheme_all() can re-run it later.
-    Widgets that get destroyed are simply skipped (TclError) rather than
-    cleaned out of the list - harmless, just a few dead closures over time."""
+    Closures for destroyed widgets (closed review windows...) fail with
+    TclError and are dropped - on every retheme, and whenever the list has
+    doubled since it was last tidied, so it can't grow without limit."""
     apply_fn()
     THEMED_WIDGETS.append(apply_fn)
+    if len(THEMED_WIDGETS) >= _NEXT_PRUNE[0]:
+        _prune_themed_widgets()
+        _NEXT_PRUNE[0] = max(1000, 2 * len(THEMED_WIDGETS))
+
+
+def _prune_themed_widgets():
+    alive = []
+    for apply_fn in THEMED_WIDGETS:
+        try:
+            apply_fn()
+            alive.append(apply_fn)
+        except tk.TclError:
+            pass  # its widget was destroyed
+    THEMED_WIDGETS[:] = alive
 
 
 def retheme_all():
@@ -250,11 +270,7 @@ def retheme_all():
     style.map("Treeview", background=[("selected", THEME["ACCENT"])], foreground=[("selected", "#ffffff")])
     style.map("Treeview.Heading", background=[("active", THEME["BUTTON_ACTIVE_BG"])])
 
-    for apply_fn in list(THEMED_WIDGETS):
-        try:
-            apply_fn()
-        except tk.TclError:
-            pass  # widget was destroyed - nothing to do
+    _prune_themed_widgets()
 
 
 def mix_color(color, other, amount):
@@ -415,6 +431,12 @@ def set_accent_color(color: str):
     retheme_all()
 
 
+def set_cover_fallback(enabled: bool):
+    global COVER_FALLBACK
+    COVER_FALLBACK = bool(enabled)
+    save_settings()
+
+
 def set_show_log_panels(show: bool):
     global SHOW_LOG_PANELS
     SHOW_LOG_PANELS = bool(show)
@@ -441,6 +463,7 @@ def settings_file_path() -> Path:
 
 def load_settings():
     global THEME_NAME, COOKIE_BROWSER, LARGE_LIBRARY_MODE, METADATA_MIN_SCORE, SHOW_LOG_PANELS, ACCENT_COLOR
+    global COVER_FALLBACK
     try:
         data = json.loads(settings_file_path().read_text(encoding="utf-8"))
         name = data.get("theme")
@@ -455,6 +478,7 @@ def load_settings():
         if data.get("min_match") in MIN_MATCH_CHOICES:
             METADATA_MIN_SCORE = data["min_match"]
         SHOW_LOG_PANELS = bool(data.get("show_log_panels", False))
+        COVER_FALLBACK = bool(data.get("cover_fallback", True))
         if isinstance(data.get("accent"), str) and re.fullmatch(r"#[0-9a-fA-F]{6}", data["accent"]):
             ACCENT_COLOR = data["accent"].lower()
         saved_include = data.get("library_include")
@@ -472,7 +496,7 @@ def save_settings():
             json.dumps({"theme": THEME_NAME, "cookie_browser": COOKIE_BROWSER,
                         "large_library_mode": LARGE_LIBRARY_MODE, "min_match": METADATA_MIN_SCORE,
                         "library_include": LIBRARY_INCLUDE, "show_log_panels": SHOW_LOG_PANELS,
-                        "accent": ACCENT_COLOR}),
+                        "accent": ACCENT_COLOR, "cover_fallback": COVER_FALLBACK}),
             encoding="utf-8"
         )
     except Exception:
@@ -504,24 +528,6 @@ def style_status_label(widget, kind="normal"):
     register(apply)
 
 
-def style_entry(widget):
-    if isinstance(widget, ttk.Widget):
-        return  # coloured by configure_ttk_styles
-    register(lambda: widget.configure(
-        bg=THEME["ENTRY_BG"], fg=THEME["FG"], insertbackground=THEME["FG"], relief="flat",
-        highlightthickness=1, highlightbackground=THEME["ROW_BORDER"], highlightcolor=THEME["ACCENT"]
-    ))
-
-
-def style_button(widget):
-    if isinstance(widget, ttk.Widget):
-        return
-    register(lambda: widget.configure(
-        bg=THEME["BUTTON_BG"], fg=THEME["FG"], activebackground=THEME["BUTTON_ACTIVE_BG"],
-        activeforeground=THEME["FG"], relief="flat", highlightthickness=0
-    ))
-
-
 def style_frame(widget):
     register(lambda: widget.configure(bg=THEME["BG"]))
 
@@ -533,15 +539,6 @@ def style_canvas(widget):
 def style_row_frame(widget):
     """A bordered row (used in review lists) - background + border color."""
     register(lambda: widget.configure(bg=THEME["BG"], highlightbackground=THEME["ROW_BORDER"]))
-
-
-def style_checkbutton(widget):
-    if isinstance(widget, ttk.Widget):
-        return
-    register(lambda: widget.configure(
-        bg=THEME["BG"], fg=THEME["FG"], selectcolor=THEME["ENTRY_BG"], activebackground=THEME["BG"],
-        activeforeground=THEME["FG"], highlightthickness=0
-    ))
 
 
 def style_radiobutton(widget, highlighted=False):
@@ -566,17 +563,6 @@ def style_scrolledtext(widget):
     register(lambda: widget.configure(bg=THEME["ENTRY_BG"], fg=THEME["FG"], insertbackground=THEME["FG"],
                                        relief="flat", highlightthickness=0, selectbackground=THEME["ACCENT"],
                                        selectforeground="#ffffff"))
-
-
-def style_optionmenu(widget, menu):
-    if isinstance(widget, ttk.Widget):
-        return  # ThemedOptionMenu colours its own dropdown
-
-    def apply():
-        widget.configure(bg=THEME["BUTTON_BG"], fg=THEME["FG"], activebackground=THEME["BUTTON_ACTIVE_BG"],
-                          activeforeground=THEME["FG"], highlightthickness=0, relief="flat")
-        menu.configure(bg=THEME["ENTRY_BG"], fg=THEME["FG"])
-    register(apply)
 
 
 def style_listbox(widget):
@@ -718,15 +704,18 @@ class ThemedScrolledText(tk.Text):
 
 
 _SCROLL_CANVASES = []
+_WHEEL_BOUND = []
 
 
 def make_wheel_scrollable(canvas):
     """Mouse-wheel / trackpad scrolling for a canvas while the pointer is over
     it, on Windows (<MouseWheel> in steps of 120), macOS (<MouseWheel> in
     small steps) and Linux (<Button-4>/<Button-5>)."""
+    _SCROLL_CANVASES[:] = [c for c in _SCROLL_CANVASES if c.winfo_exists()]  # drop closed windows' canvases
     _SCROLL_CANVASES.append(canvas)
-    if len(_SCROLL_CANVASES) > 1:
+    if _WHEEL_BOUND:
         return
+    _WHEEL_BOUND.append(True)
 
     def canvas_under(widget):
         while widget is not None:
@@ -915,6 +904,70 @@ def setup_fonts(root):
             tkfont.nametofont(name).configure(family=family, **options)
         else:
             tkfont.Font(root, name=name, family=family, **options)
+
+
+class KeepAwake:
+    """Stops the computer going to sleep while a long job runs - scans,
+    applying tags, Download All, converting, copying playlists. The screen
+    can still turn off and lock as normal. Nestable and shared across
+    threads: awake while at least one job is running.
+      Windows: SetThreadExecutionState, held by a small helper thread (the
+               setting belongs to the thread that made it).
+      macOS:   `caffeinate -i` while TrackMatch is busy.
+      Linux:   `systemd-inhibit` where available.
+    Anything unavailable is skipped silently - the job still runs."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._count = 0
+        self._release = None
+
+    def __enter__(self):
+        with self._lock:
+            self._count += 1
+            if self._count == 1:
+                try:
+                    self._release = self._hold()
+                except Exception:
+                    self._release = None
+        return self
+
+    def __exit__(self, *exc):
+        with self._lock:
+            self._count -= 1
+            if self._count == 0 and self._release:
+                try:
+                    self._release()
+                except Exception:
+                    pass
+                self._release = None
+        return False
+
+    @staticmethod
+    def _hold():
+        if sys.platform == "win32":
+            ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+            done = threading.Event()
+
+            def holder():
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+                done.wait()
+                ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+            threading.Thread(target=holder, name="keep-awake", daemon=True).start()
+            return done.set
+        if sys.platform == "darwin":
+            cmd = ["caffeinate", "-i", "-w", str(os.getpid())]
+        elif shutil.which("systemd-inhibit"):
+            cmd = ["systemd-inhibit", "--what=sleep:idle", "--who=TrackMatch",
+                   "--why=TrackMatch is working", "sleep", "infinity"]
+        else:
+            return None
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return proc.terminate
+
+
+KEEP_AWAKE = KeepAwake()
 
 
 def install_error_logging(app):
@@ -1170,25 +1223,81 @@ def read_existing_tags(filepath: Path):
     return {"title": title, "artist": artist, "album": album, "genre": genre}
 
 
+# Words too common to narrow down a match ("the", "remix", single letters...).
+MATCH_STOPWORDS = {"the", "a", "an", "and", "of", "in", "on", "to", "my", "me", "you", "is", "it", "feat", "ft",
+                   "vs", "mix", "remix", "edit", "original", "version", "radio", "extended", "club", "remastered"}
+
+
+def _match_words(norm_title, artist_set):
+    words = set(norm_title.split())
+    for artist in artist_set:
+        words.update(artist.split())
+    return {w for w in words if len(w) > 1 and w not in MATCH_STOPWORDS}
+
+
+class MusicIndex(list):
+    """The audio files in a music folder with their normalized title/artist,
+    plus a word -> files lookup, so matching only compares a song against
+    files sharing at least one word with it instead of every file in the
+    folder (the slow part with big libraries)."""
+
+    def __init__(self, entries):
+        super().__init__(entries)
+        self.postings = {}
+        for i, entry in enumerate(self):
+            for word in _match_words(entry["norm_title"], entry["artist_set"]):
+                self.postings.setdefault(word, []).append(i)
+
+    def candidates(self, norm_title, artist_set):
+        ids = set()
+        for word in _match_words(norm_title, artist_set):
+            ids.update(self.postings.get(word, ()))
+        # Nothing in common with any file: fall back to comparing against everything.
+        return [self[i] for i in ids] if ids else self
+
+
+# Title/artist read from each file this session, keyed by path and reused
+# while the file's size and modified time are unchanged - re-running a
+# playlist against the same folder only re-reads new or changed files.
+_FILE_TAG_CACHE = {}
+_FILE_TAG_LOCK = threading.Lock()
+
+
 def index_music_folder(music_dir: Path, log):
     log(f"Scanning {music_dir} for audio files...")
     all_files = [p for p in music_dir.rglob("*") if p.suffix.lower() in AUDIO_EXTENSIONS]
     log(f"Found {len(all_files)} audio files. Reading metadata...")
+    counts = {"done": 0, "read": 0}
 
-    index = []
-    for i, filepath in enumerate(all_files, 1):
-        title, artist = read_local_metadata(filepath)
-        index.append({
-            "path": filepath,
-            "title": title,
-            "artist": artist,
-            "norm_title": normalize(title),
-            "artist_set": split_artists(artist),
-        })
-        if i % 200 == 0:
-            log(f"  ...{i}/{len(all_files)}")
+    def entry_for(filepath):
+        try:
+            st = filepath.stat()
+        except OSError:
+            return None
+        key = str(filepath)
+        with _FILE_TAG_LOCK:
+            cached = _FILE_TAG_CACHE.get(key)
+        if cached and cached[0] == st.st_size and cached[1] == st.st_mtime_ns:
+            title, artist = cached[2], cached[3]
+        else:
+            title, artist = read_local_metadata(filepath)
+            with _FILE_TAG_LOCK:
+                _FILE_TAG_CACHE[key] = (st.st_size, st.st_mtime_ns, title, artist)
+                counts["read"] += 1
+        with _FILE_TAG_LOCK:
+            counts["done"] += 1
+            if counts["done"] % 500 == 0:
+                log(f"  ...{counts['done']}/{len(all_files)}")
+        return {"path": filepath, "title": title, "artist": artist,
+                "norm_title": normalize(title), "artist_set": split_artists(artist)}
 
-    return index
+    # Reading tags is mostly waiting on the disk, so several at once is much faster.
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        entries = [e for e in pool.map(entry_for, all_files) if e]
+    reused = len(entries) - counts["read"]
+    if reused:
+        log(f"  {reused} unchanged since the last scan this session - only {counts['read']} read again.")
+    return MusicIndex(entries)
 
 
 def score_match(target_title, target_artist_set, candidate):
@@ -1212,9 +1321,10 @@ def score_match(target_title, target_artist_set, candidate):
 def find_best_match(track, index):
     norm_title = normalize(track["title"])
     target_artist_set = split_artists(track["artist"])
+    pool = index.candidates(norm_title, target_artist_set) if isinstance(index, MusicIndex) else index
 
     best_candidate, best_score = None, 0.0
-    for candidate in index:
+    for candidate in pool:
         score = score_match(norm_title, target_artist_set, candidate)
         if score > best_score:
             best_candidate, best_score = candidate, score
@@ -1658,6 +1768,26 @@ def fetch_youtube_track(track, video, dest_dir: Path, dl_opts, log, progress=Non
 
 BEATPORT_SEARCH_URL = "https://www.beatport.com/search/tracks?q={query}"
 BEATPORT_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+
+_HTTP = {"session": None}
+_HTTP_LOCK = threading.Lock()
+
+
+def http_get(url, **kwargs):
+    """requests.get through one shared session, so repeat requests to the same
+    site reuse the open connection - about 3x faster than connecting afresh
+    every time. Safe to use from several threads at once."""
+    with _HTTP_LOCK:
+        if _HTTP["session"] is None:
+            session = requests.Session()
+            adapter = requests.adapters.HTTPAdapter(pool_connections=16, pool_maxsize=16)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            session.headers.update(BEATPORT_HEADERS)
+            _HTTP["session"] = session
+    kwargs.setdefault("timeout", 15)
+    return _HTTP["session"].get(url, **kwargs)
 BEATPORT_COVER_SIZE = 500  # px, square - Beatport's CDN resizes the release artwork to this
 
 # A lookup result (from any source) has to score at least METADATA_MIN_SCORE
@@ -1794,7 +1924,7 @@ def _fetch_beatport_tracks(query: str, dbg):
     url = BEATPORT_SEARCH_URL.format(query=requests.utils.quote(query))
     for attempt in range(4):
         _BEATPORT_LIMITER.wait()
-        resp = requests.get(url, headers=BEATPORT_HEADERS, timeout=15)
+        resp = http_get(url, headers=BEATPORT_HEADERS, timeout=15)
         dbg(f"GET {url} -> HTTP {resp.status_code}, {len(resp.text)} bytes")
         # Refused/overloaded (e.g. after many searches in a row) - back off and retry
         # rather than reporting "None found" for the rest of a big scan.
@@ -1957,7 +2087,7 @@ DEEZER_API = "https://api.deezer.com"
 ITUNES_SEARCH_URL = "https://itunes.apple.com/search"
 ITUNES_COUNTRY = "US"       # which iTunes store to search - the US store has the widest catalogue
 ITUNES_COVER_SIZE = 1400    # px, square - Apple's CDN renders the artwork at the requested size
-DEEZER_ENRICH_TOP = 3       # genre/label/date need 2 extra requests per result, so only for the top few
+DEEZER_ENRICH_TOP = 1       # genre/label/date need 2 extra requests per result - the best one now, others when applied
 
 
 class _RateLimiter:
@@ -1988,7 +2118,7 @@ def _get_json(url, params, limiter, service):
         raise RuntimeError("Missing dependency. Run: pip install requests")
     for attempt in range(4):
         limiter.wait()
-        resp = requests.get(url, params=params, headers=BEATPORT_HEADERS, timeout=15)
+        resp = http_get(url, params=params, headers=BEATPORT_HEADERS, timeout=15)
         if resp.status_code in (403, 429) or resp.status_code >= 500:
             if attempt < 3:
                 time.sleep(5 * (attempt + 1))
@@ -2068,6 +2198,7 @@ def _enrich_deezer_result(r):
             r["date"] = r["date"] or (album.get("release_date") or "")[:10]
             r["image_url"] = album.get("cover_xl") or r["image_url"]
     r["year"] = r["date"][:4]
+    r["_enriched"] = True
 
 
 def search_deezer(artist: str, title: str, max_results: int = 5, log=None, length=None):
@@ -2162,31 +2293,58 @@ def find_itunes_album_art(artist: str, album: str):
     return ""
 
 
+_BLOCKED_IMAGE_HOSTS = set()
+# iTunes artwork found for an album this session: (artist, album) -> (url, album shown) - many
+# songs share an album, and each iTunes lookup costs ~3s because of Apple's rate limit.
+_ITUNES_ART_CACHE = {}
+_COVER_LOCK = threading.Lock()
+
+
 def fetch_cover_art(result, log=None):
     """Downloads a lookup result's cover. If that fails - Deezer's image
     server refuses some connections outright (HTTP 403) even though its
-    API works - falls back to the same album's artwork on iTunes.
+    API works - and "Find missing covers on iTunes" is on, falls back to the
+    same album's artwork on iTunes (remembered per album for the session).
     Returns (bytes, mime) or (None, None)."""
-    image_bytes, image_mime = download_image(result.get("image_url", ""))
-    if image_bytes or result.get("source") == "iTunes" or not result.get("release"):
+    url = result.get("image_url", "")
+    host = urlparse(url).netloc if url else ""
+    image_bytes, image_mime = download_image(url)
+    if image_bytes or result.get("source") == "iTunes" or not result.get("release") or not COVER_FALLBACK:
         return image_bytes, image_mime
-    try:
-        url = find_itunes_album_art(result.get("artists", ""), result["release"])
-        where = f"\"{result['release']}\""
-        if not url:
-            # The song may sit on a differently-named album there - look the
-            # track itself up and use its release's artwork if it's confident.
-            matches = search_itunes(result.get("artists", ""), result.get("base_title") or result["title"],
-                                    max_results=1, length=result.get("length"))
-            if matches and matches[0]["score"] >= METADATA_MIN_SCORE:
-                url, where = matches[0]["image_url"], f"\"{matches[0]['release']}\""
-    except Exception:
-        url = ""
-    if url:
-        image_bytes, image_mime = download_image(url)
+    if host in _BLOCKED_IMAGE_HOSTS and log and host not in _COVER_NOTICES:
+        _COVER_NOTICES.add(host)
+        log(f"    {result['source']}'s image server is refusing downloads on this connection - using iTunes "
+            f"artwork instead (slower: iTunes allows ~20 lookups a minute). You can turn this off in Settings.")
+
+    album_core = re.sub(r"[(\[][^()\[\]]*[)\]]", " ", result["release"])  # "After Hours (Deluxe)" = "After Hours"
+    key = (normalize(re.split(r",|&", result.get("artists", ""))[0]), normalize(album_core))
+    with _COVER_LOCK:
+        cached = _ITUNES_ART_CACHE.get(key)
+    if cached is not None:
+        art_url, where = cached
+    else:
+        try:
+            art_url = find_itunes_album_art(result.get("artists", ""), result["release"])
+            where = f"\"{result['release']}\""
+            if not art_url:
+                # The song may sit on a differently-named album there - look the
+                # track itself up and use its release's artwork if it's confident.
+                matches = search_itunes(result.get("artists", ""), result.get("base_title") or result["title"],
+                                        max_results=1, length=result.get("length"))
+                if matches and matches[0]["score"] >= METADATA_MIN_SCORE:
+                    art_url, where = matches[0]["image_url"], f"\"{matches[0]['release']}\""
+        except Exception:
+            return None, None  # network trouble - don't remember a miss
+        with _COVER_LOCK:
+            _ITUNES_ART_CACHE[key] = (art_url, where)
+    if art_url:
+        image_bytes, image_mime = download_image(art_url)
         if image_bytes and log:
             log(f"    {result['source']} cover unavailable - used the iTunes artwork for {where}")
     return image_bytes, image_mime
+
+
+_COVER_NOTICES = set()
 
 
 METADATA_SEARCHERS = {"Beatport": search_beatport, "Deezer": search_deezer, "iTunes": search_itunes}
@@ -2200,15 +2358,16 @@ METADATA_SOURCE_LABELS = {
 }
 
 
-def lookup_metadata(source, artist, title, length=None, log=None, max_results=6):
+def lookup_metadata(source, artist, title, length=None, log=None, max_results=6, errors=None):
     """Looks a track up on one source, or in Auto mode on Beatport, then
     Deezer, then iTunes - stopping at the first source with a confident
     match (score >= METADATA_MIN_SCORE), so electronic tracks keep
     Beatport's BPM/key and the slow iTunes API is only used for leftovers.
 
     Returns (results best-first across every source tried, [sources tried]).
-    A source that errors is logged and skipped rather than failing the
-    lookup."""
+    A source that errors (network down, site refusing...) is logged and
+    skipped rather than failing the lookup - and added to `errors` if a list
+    is passed, so callers know the answer may be incomplete."""
     order = METADATA_AUTO_ORDER if source == METADATA_AUTO else [source]
     results, tried = [], []
     for name in order:
@@ -2218,6 +2377,8 @@ def lookup_metadata(source, artist, title, length=None, log=None, max_results=6)
         except Exception as e:
             if log:
                 log(f"    {name} lookup failed: {e}")
+            if errors is not None:
+                errors.append(name)
             found = []
         results.extend(found)
         if found and found[0]["score"] >= METADATA_MIN_SCORE:
@@ -2415,8 +2576,15 @@ def download_image(url: str, any_format=False):
     using the server's Content-Type as the mime."""
     if requests is None or not url:
         return None, None
+    host = urlparse(url).netloc
+    if host in _BLOCKED_IMAGE_HOSTS:
+        return None, None
     try:
-        resp = requests.get(url, headers=BEATPORT_HEADERS, timeout=15)
+        resp = http_get(url, headers=BEATPORT_HEADERS, timeout=15)
+        if resp.status_code in (401, 403):
+            # Some image servers (Deezer's, on some connections) refuse every
+            # request - stop asking for the rest of the session.
+            _BLOCKED_IMAGE_HOSTS.add(host)
         resp.raise_for_status()
     except Exception:
         return None, None
@@ -2609,12 +2777,14 @@ def estimate_converted_size(path: Path, target, bitrate):
     return pcm * 0.6 if target == "flac" else pcm
 
 
-def read_tags_and_cover(path: Path):
+def read_tags_and_cover(path: Path, audio=None):
     """Reads the tags embed_full_metadata can write (title, artist list,
     album, genre, date/year, bpm, label, key, isrc) plus the front cover
-    from any supported format. Returns (fields, image_bytes, mime)."""
+    from any supported format. Returns (fields, image_bytes, mime). Pass
+    `audio` if the file has already been opened with mutagen."""
     fields, image, mime = {}, None, None
-    audio = MutagenFile(path)
+    if audio is None:
+        audio = MutagenFile(path)
     tags = getattr(audio, "tags", None) if audio is not None else None
     if tags is None:
         return fields, None, None
@@ -2821,7 +2991,7 @@ class AudioConverter:
     def _run_all(self):
         summary = {"converted": 0, "existing": 0, "failed": 0, "cancelled": 0, "recycled": 0,
                    "recycle_failed": 0, "bytes_before": 0, "bytes_after": 0}
-        with ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as pool:
+        with KEEP_AWAKE, ThreadPoolExecutor(max_workers=CONVERT_WORKERS) as pool:
             for outcome in pool.map(self._convert_one, self.files):
                 for key, value in outcome.items():
                     summary[key] += value
@@ -3068,6 +3238,34 @@ def set_visible(widget, visible, **pack_options):
         widget.pack_forget()
 
 
+LOG_PANEL_MAX_LINES = 3000  # a tab's log panel keeps this many lines; the session log file keeps everything
+
+
+class LogPanelMixin:
+    """The log() every tab uses: writes the message to the session log file,
+    shows it on the tab's status line, and adds it to the tab's log panel
+    (trimmed to the last LOG_PANEL_MAX_LINES lines, so a 6000-song scan
+    doesn't keep growing it). Safe to call from background threads."""
+
+    def log(self, message: str):
+        SESSION_LOG.write(log_source_name(self), message)
+        update_status_line(self, message)
+
+        def append():
+            box = self.log_box
+            box.configure(state="normal")
+            box.insert(tk.END, message + "\n")
+            lines = int(box.index("end-1c").split(".")[0])
+            if lines > LOG_PANEL_MAX_LINES:
+                box.delete("1.0", f"{lines - LOG_PANEL_MAX_LINES + 1}.0")
+            box.see(tk.END)
+            box.configure(state="disabled")
+        try:
+            self.after(0, append)
+        except (tk.TclError, RuntimeError):
+            pass  # tab closed while a background job was still reporting
+
+
 class DownloadOptions:
     """What the user picked for YouTube downloads - read once on the Tk
     thread, then handed to worker threads (Tk variables aren't thread-safe)."""
@@ -3172,7 +3370,7 @@ class BatchDownloader:
         self.log(f"\nDownloading {len(self.jobs)} tracks ({self.dl_opts.describe()}), "
                  f"{DOWNLOAD_WORKERS} at a time...")
         counts = {"downloaded": 0, "existing": 0, "manual": 0, "failed": 0, "cancelled": 0}
-        with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        with KEEP_AWAKE, ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
             for outcome in pool.map(lambda job: self._run_one(*job), self.jobs):
                 counts[outcome] += 1
         self.log(f"\nDownload All finished: {counts['downloaded']} downloaded, {counts['existing']} already "
@@ -3227,10 +3425,8 @@ def make_batch_controls(parent, start_fn, cancel_fn):
     """Download All / Cancel buttons for a review window's bottom bar.
     Returns (download_all_btn, cancel_btn)."""
     cancel_btn = ThemedButton(parent, text="Cancel Downloads", command=cancel_fn, state="disabled")
-    style_button(cancel_btn)
     cancel_btn.pack(side="left", padx=(6, 0))
     all_btn = ThemedButton(parent, text="Download All Selected", command=start_fn, accent=True)
-    style_button(all_btn)
     all_btn.pack(side="left", before=cancel_btn)
     return all_btn, cancel_btn
 
@@ -3264,7 +3460,7 @@ def _get_page(url, limiter, service):
         raise RuntimeError("Missing dependency. Run: pip install requests")
     for attempt in range(4):
         limiter.wait()
-        resp = requests.get(url, headers=BEATPORT_HEADERS, timeout=20)
+        resp = http_get(url, headers=BEATPORT_HEADERS, timeout=20)
         if (resp.status_code in (429, 403) or resp.status_code >= 500) and attempt < 3:
             time.sleep(5 * (attempt + 1))
             continue
@@ -3516,7 +3712,7 @@ def load_playlist_source(source, pasted, log, progress=None):
             raise ValueError("Paste a playlist link, browse to a playlist file, or use Paste Songs.")
         if re.match(r"https?://", source, re.IGNORECASE):
             if "link.deezer.com" in source or "deezer.page.link" in source:
-                source = requests.get(source, headers=BEATPORT_HEADERS, timeout=15, allow_redirects=True).url
+                source = http_get(source, headers=BEATPORT_HEADERS, timeout=15, allow_redirects=True).url
             spotify, deezer = SPOTIFY_URL_RE.search(source), DEEZER_URL_RE.search(source)
             if spotify:
                 tracks, name = load_spotify(spotify.group(1), spotify.group(2), log)
@@ -3564,10 +3760,8 @@ class PlaylistSourceInput:
         self.entry = ThemedEntry(row, placeholder="Paste a Spotify, Deezer, Apple Music or YouTube link...")
         self.entry.pack(side="left", fill="x", expand=True)
         browse = ThemedButton(row, text="Browse...", command=self.browse)
-        style_button(browse)
         browse.pack(side="left", padx=(6, 0))
         paste = ThemedButton(row, text="Paste Songs...", command=self.open_paste_dialog)
-        style_button(paste)
         paste.pack(side="left", padx=(6, 0))
         self.parent = parent
         self.pasted = ""
@@ -3622,10 +3816,8 @@ class PlaylistSourceInput:
             dialog.destroy()
 
         ok_btn = ThemedButton(bottom, text="Use These Songs", command=use, accent=True)
-        style_button(ok_btn)
         ok_btn.pack(side="right")
         cancel_btn = ThemedButton(bottom, text="Cancel", command=dialog.destroy, width=10)
-        style_button(cancel_btn)
         cancel_btn.pack(side="right", padx=(0, 6))
         dialog.grab_set()
 
@@ -3640,7 +3832,7 @@ class PlaylistSourceInput:
 
 # ---------- Tab 1: Download Missing Tracks ----------
 
-class DownloadTab(tk.Frame):
+class DownloadTab(LogPanelMixin, tk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
         style_frame(self)
@@ -3688,17 +3880,6 @@ class DownloadTab(tk.Frame):
 
     def toggle_same_folder(self):
         set_visible(self.dest_row, not self.same_folder_var.get(), fill="x", pady=(4, 0))
-
-    def log(self, message: str):
-        SESSION_LOG.write(log_source_name(self), message)
-        update_status_line(self, message)
-
-        def append():
-            self.log_box.configure(state="normal")
-            self.log_box.insert(tk.END, message + "\n")
-            self.log_box.see(tk.END)
-            self.log_box.configure(state="disabled")
-        self.after(0, append)
 
     def run_clicked(self):
         source = self.playlist_input.get()
@@ -3763,6 +3944,99 @@ class DownloadTab(tk.Frame):
             self.after(0, lambda: self.run_button.configure(state="normal"))
 
 
+class PagedReviewMixin:
+    """Pages of PAGE_SIZE rows for the Download and Playlist review windows.
+    Building a block of controls for every song is what made big reviews
+    slow (1000 songs took ~6s to open), so only the visible page has
+    widgets. Everything about a row - its choices, ticks and status text -
+    lives in variables and dicts that outlive its widgets. The window
+    provides build_row(idx, parent) and on_page_shown() (optional)."""
+
+    PAGE_SIZE = 100
+
+    def make_review_area(self):
+        """The scrolling list the rows go in, plus the page navigation bar."""
+        self.page = 0
+        self.row_status_text = {}   # idx -> latest status line
+        self.include_state = {}     # idx -> "normal" / "disabled"
+        self.status_labels = {}     # visible rows only
+        self.include_checks = {}    # visible rows only
+        self.page_count = max(1, -(-len(self.items) // self.PAGE_SIZE))
+
+        self.nav = tk.Frame(self); style_frame(self.nav)
+        if self.page_count > 1:
+            self.nav.pack(fill="x", padx=10, pady=(6, 0))
+            self.prev_btn = ThemedButton(self.nav, text="\u25c0  Previous", command=lambda: self.show_page(self.page - 1))
+            self.prev_btn.pack(side="left")
+            self.next_btn = ThemedButton(self.nav, text="Next  \u25b6", command=lambda: self.show_page(self.page + 1))
+            self.next_btn.pack(side="right")
+            self.page_label = tk.Label(self.nav, text="")
+            style_label(self.page_label, subtle=True)
+            self.page_label.pack(side="left", expand=True)
+
+        area = tk.Frame(self); style_frame(area)
+        area.pack(side="top", fill="both", expand=True, padx=10, pady=(6, 10))
+        self.canvas = tk.Canvas(area, borderwidth=0)
+        style_canvas(self.canvas)
+        self.scroll_frame = tk.Frame(self.canvas); style_frame(self.scroll_frame)
+        scrollbar = ttk.Scrollbar(area, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.create_window((0, 0), window=self.scroll_frame, anchor="nw")
+        self.scroll_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        make_wheel_scrollable(self.canvas)
+
+    def show_page(self, page):
+        self.page = max(0, min(page, self.page_count - 1))
+        for child in self.scroll_frame.winfo_children():
+            child.destroy()
+        self.status_labels.clear()
+        self.include_checks.clear()
+        if hasattr(self, "on_page_cleared"):
+            self.on_page_cleared()
+        start = self.page * self.PAGE_SIZE
+        end = min(start + self.PAGE_SIZE, len(self.items))
+        for idx in range(start, end):
+            self.build_row(idx, self.scroll_frame)
+        self.canvas.yview_moveto(0)
+        if self.page_count > 1:
+            self.page_label.configure(text=f"Songs {start + 1}-{end} of {len(self.items)}  "
+                                           f"(page {self.page + 1} of {self.page_count})")
+            self.prev_btn.configure(state="normal" if self.page > 0 else "disabled")
+            self.next_btn.configure(state="normal" if self.page < self.page_count - 1 else "disabled")
+
+    def add_status_label(self, idx, row, **pack):
+        label = tk.Label(row, text=self.row_status_text.get(idx, ""), justify="left", anchor="w", wraplength=760)
+        style_label(label, subtle=True)
+        label.pack(fill="x", padx=6, pady=(0, 4), **pack)
+        self.status_labels[idx] = label
+
+    def add_include_check(self, idx, parent, **pack):
+        check = ThemedCheckbutton(parent, text="Include in Download All", variable=self.include_vars[idx],
+                                  state=self.include_state.get(idx, "normal"))
+        check.pack(side="left", **pack)
+        self.include_checks[idx] = check
+
+    def set_row_status(self, idx, text):
+        """Thread-safe: remembers the row's status and shows it if the row is on screen."""
+        def update():
+            self.row_status_text[idx] = text
+            label = self.status_labels.get(idx)
+            if label is not None and label.winfo_exists():
+                label.configure(text=text)
+        try:
+            self.after(0, update)
+        except (tk.TclError, RuntimeError):
+            pass  # window closed while a background job was still reporting
+
+    def set_include_state(self, idx, state):
+        self.include_state[idx] = state
+        check = self.include_checks.get(idx)
+        if check is not None and check.winfo_exists():
+            check.configure(state=state)
+
+
 class BatchDownloadMixin:
     """Download All / Cancel behaviour shared by both review windows. The
     window provides: items, dl_opts, log, include_vars / include_checks
@@ -3785,7 +4059,7 @@ class BatchDownloadMixin:
         self.download_all_btn.configure(state="disabled")
         self.cancel_btn.configure(state="normal")
         for i, _ in jobs:
-            self.include_checks[i].configure(state="disabled")
+            self.set_include_state(i, "disabled")
         self.batch = BatchDownloader(self, jobs, self.download_dir(), self.dl_opts, self.log,
                                      self.set_row_status, self.on_batch_downloaded, self.on_batch_finished)
         self.batch.start()
@@ -3802,9 +4076,9 @@ class BatchDownloadMixin:
             return
         self.cancel_btn.configure(state="disabled")
         self.download_all_btn.configure(state="normal")
-        for i, var in self.include_vars.items():
+        for i in self.include_vars:
             if not self.row_done(i):
-                self.include_checks[i].configure(state="normal")
+                self.set_include_state(i, "normal")
         messagebox.showinfo(
             "Download All finished",
             f"{counts['downloaded']} downloaded\n{counts['existing']} already in folder\n"
@@ -3828,7 +4102,7 @@ class BatchDownloadMixin:
             self.destroy()
 
 
-class DownloadReviewWindow(BatchDownloadMixin, tk.Toplevel):
+class DownloadReviewWindow(PagedReviewMixin, BatchDownloadMixin, tk.Toplevel):
     """Lists every playlist track with its status against the checked folder
     (found / missing, with score). Download All Selected fetches every
     ticked row automatically (missing/uncertain rows are ticked by
@@ -3850,12 +4124,24 @@ class DownloadReviewWindow(BatchDownloadMixin, tk.Toplevel):
         self.dest_dir = dest_dir
         self.dl_opts = dl_opts
         self.log = log
-        self.status_labels = {}
-        self.match_labels = {}
-        self.match_kinds = {}     # idx -> 'found'/'missing', read by the match label's theme closure
-        self.include_vars = {}
-        self.include_checks = {}
         self.batch = None
+        self.match_text = {}      # idx -> found / possible / not found line
+        self.match_kinds = {}     # idx -> 'found'/'missing', read by the match label's theme closure
+        self.match_labels = {}    # visible rows only
+        self.include_vars = {}
+        for i, item in enumerate(items):
+            candidate, score = item["candidate"], item["score"]
+            if candidate and score >= self.FOUND_THRESHOLD:
+                self.match_text[i] = f"Found: \"{candidate['path'].name}\" (score {score:.2f})"
+                self.match_kinds[i] = "found"
+            elif candidate:
+                self.match_text[i] = (f"Possible match: \"{candidate['path'].name}\" (score {score:.2f}) - "
+                                      f"check carefully")
+                self.match_kinds[i] = "missing"
+            else:
+                self.match_text[i] = "Not found in the folder"
+                self.match_kinds[i] = "missing"
+            self.include_vars[i] = tk.BooleanVar(value=score < self.FOUND_THRESHOLD)
 
         found = sum(1 for it in items if it["score"] >= self.FOUND_THRESHOLD)
         header = tk.Label(
@@ -3869,83 +4155,43 @@ class DownloadReviewWindow(BatchDownloadMixin, tk.Toplevel):
         style_label(header, subtle=True)
         header.pack(anchor="w", padx=10, pady=(10, 0))
 
-        canvas = tk.Canvas(self, borderwidth=0)
-        style_canvas(canvas)
-        scroll_frame = tk.Frame(canvas); style_frame(scroll_frame)
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="top", fill="both", expand=True, padx=10, pady=10)
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        make_wheel_scrollable(canvas)
-
-        for i, item in enumerate(items):
-            track, candidate, score = item["track"], item["candidate"], item["score"]
-            row = tk.Frame(scroll_frame, relief="groove", borderwidth=1, highlightthickness=1)
-            style_row_frame(row)
-            row.pack(fill="x", pady=4, padx=2)
-
-            title_label = tk.Label(row, text=f"{track['artist']} - {track['title']}", justify="left", anchor="w")
-            style_label(title_label)
-            title_label.pack(fill="x", padx=6, pady=(4, 0))
-
-            if candidate and score >= self.FOUND_THRESHOLD:
-                status_text = f"Found: \"{candidate['path'].name}\" (score {score:.2f})"
-                status_kind = "found"
-            elif candidate:
-                status_text = f"Possible match: \"{candidate['path'].name}\" (score {score:.2f}) - check carefully"
-                status_kind = "missing"
-            else:
-                status_text = "Not found in the folder"
-                status_kind = "missing"
-            match_label = tk.Label(row, text=status_text, justify="left", anchor="w")
-            self.match_kinds[i] = status_kind
-            register(lambda lbl=match_label, idx=i: lbl.configure(
-                bg=THEME["BG"], fg=THEME["FOUND_FG" if self.match_kinds[idx] == "found" else "MISSING_FG"]))
-            match_label.pack(fill="x", padx=6, pady=(0, 2))
-            self.match_labels[i] = match_label
-
-            control_frame = tk.Frame(row); style_frame(control_frame)
-            control_frame.pack(fill="x", padx=6, pady=(0, 6))
-            yt_btn = ThemedButton(control_frame, text="Search YouTube", command=lambda idx=i: self.search_youtube_for(idx))
-            style_button(yt_btn)
-            yt_btn.pack(side="left")
-            include_var = tk.BooleanVar(value=score < self.FOUND_THRESHOLD)
-            include_chk = ThemedCheckbutton(control_frame, text="Include in Download All", variable=include_var)
-            style_checkbutton(include_chk)
-            include_chk.pack(side="left", padx=(10, 0))
-            self.include_vars[i] = include_var
-            self.include_checks[i] = include_chk
-
-            progress_label = tk.Label(row, text="", justify="left", anchor="w", wraplength=780)
-            style_label(progress_label, subtle=True)
-            progress_label.pack(fill="x", padx=6, pady=(0, 4))
-            self.status_labels[i] = progress_label
-
         bottom = tk.Frame(self); style_frame(bottom)
-        bottom.pack(fill="x", padx=10, pady=10)
+        bottom.pack(side="bottom", fill="x", padx=10, pady=10)
         self.download_all_btn, self.cancel_btn = make_batch_controls(bottom, self.download_all, self.cancel_downloads)
-        close_btn = ThemedButton(bottom, text="Close", command=self.close, width=12)
-        style_button(close_btn)
-        close_btn.pack(side="right")
+        ThemedButton(bottom, text="Close", command=self.close, width=12).pack(side="right")
         self.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.make_review_area()
+        self.show_page(0)
+
+    def on_page_cleared(self):
+        self.match_labels.clear()
+
+    def build_row(self, i, parent):
+        track = self.items[i]["track"]
+        row = tk.Frame(parent, relief="groove", borderwidth=1, highlightthickness=1)
+        style_row_frame(row)
+        row.pack(fill="x", pady=4, padx=2)
+        title_label = tk.Label(row, text=f"{track['artist']} - {track['title']}", justify="left", anchor="w")
+        style_label(title_label)
+        title_label.pack(fill="x", padx=6, pady=(4, 0))
+        match_label = tk.Label(row, text=self.match_text[i], justify="left", anchor="w")
+        register(lambda lbl=match_label, idx=i: lbl.configure(
+            bg=THEME["BG"], fg=THEME["FOUND_FG" if self.match_kinds[idx] == "found" else "MISSING_FG"]))
+        match_label.pack(fill="x", padx=6, pady=(0, 2))
+        self.match_labels[i] = match_label
+        control_frame = tk.Frame(row); style_frame(control_frame)
+        control_frame.pack(fill="x", padx=6, pady=(0, 6))
+        ThemedButton(control_frame, text="Search YouTube",
+                     command=lambda idx=i: self.search_youtube_for(idx)).pack(side="left")
+        self.add_include_check(i, control_frame, padx=(10, 0))
+        self.add_status_label(i, row)
 
     def download_dir(self):
         return self.dest_dir
 
     def row_done(self, idx):
         return self.match_kinds[idx] == "found"
-
-    def set_row_status(self, idx, text):
-        def update():
-            if idx in self.status_labels:
-                self.status_labels[idx].configure(text=text)
-        try:
-            self.after(0, update)
-        except (tk.TclError, RuntimeError):
-            pass  # window closed while a background job was still reporting
 
     def search_youtube_for(self, idx):
         track = self.items[idx]["track"]
@@ -3972,9 +4218,12 @@ class DownloadReviewWindow(BatchDownloadMixin, tk.Toplevel):
         """Marks the row as found, the same as if it had been in the folder
         from the start, and takes it out of any later Download All."""
         self.match_kinds[idx] = "found"
-        self.match_labels[idx].configure(text=f"Found: \"{file_path.name}\" (downloaded)", fg=THEME["FOUND_FG"])
+        self.match_text[idx] = f"Found: \"{file_path.name}\" (downloaded)"
+        label = self.match_labels.get(idx)
+        if label is not None and label.winfo_exists():
+            label.configure(text=self.match_text[idx], fg=THEME["FOUND_FG"])
         self.include_vars[idx].set(False)
-        self.include_checks[idx].configure(state="disabled")
+        self.set_include_state(idx, "disabled")
 
 # ---------- Tab 2: Create Playlist ----------
 
@@ -4007,7 +4256,7 @@ class PlaylistTab(tk.Frame):
         (self.library_panel if library else self.csv_panel).pack(fill="both", expand=True)
 
 
-class CsvPlaylistPanel(tk.Frame):
+class CsvPlaylistPanel(LogPanelMixin, tk.Frame):
     """Create Playlist tab, "From a playlist" mode - any source PlaylistSourceInput accepts."""
 
     def __init__(self, parent):
@@ -4085,17 +4334,6 @@ class CsvPlaylistPanel(tk.Frame):
         if path:
             self.output_entry.delete(0, tk.END)
             self.output_entry.insert(0, path)
-
-    def log(self, message: str):
-        SESSION_LOG.write(log_source_name(self), message)
-        update_status_line(self, message)
-
-        def append():
-            self.log_box.configure(state="normal")
-            self.log_box.insert(tk.END, message + "\n")
-            self.log_box.see(tk.END)
-            self.log_box.configure(state="disabled")
-        self.after(0, append)
 
     def run_clicked(self):
         source = self.playlist_input.get()
@@ -4179,7 +4417,7 @@ class CsvPlaylistPanel(tk.Frame):
             messagebox.showinfo("Done", f"Copied {copied}/{total_tracks} tracks.\nInto:\n{output}")
 
 
-class ReviewWindow(BatchDownloadMixin, tk.Toplevel):
+class ReviewWindow(PagedReviewMixin, BatchDownloadMixin, tk.Toplevel):
     """Shows every track with its best-guess local match pre-filled, worst
     scores first, so nothing is written to disk until you've confirmed
     (or corrected) each one. Browse to fix a wrong guess, Search YouTube
@@ -4209,9 +4447,8 @@ class ReviewWindow(BatchDownloadMixin, tk.Toplevel):
             for it in items
         ]
         self.skip_flags = [tk.BooleanVar(value=False) for _ in items]
-        self.status_labels = {}  # idx -> Label, for showing search/download progress per row
-        self.include_vars = {}   # idx -> BooleanVar for "Include in Download All"
-        self.include_checks = {}
+        self.include_vars = {i: tk.BooleanVar(value=it["score"] < DownloadReviewWindow.FOUND_THRESHOLD)
+                             for i, it in enumerate(items)}
         self.downloaded = set()  # rows filled by a YouTube download
 
         header = tk.Label(
@@ -4223,66 +4460,39 @@ class ReviewWindow(BatchDownloadMixin, tk.Toplevel):
         style_label(header, subtle=True)
         header.pack(anchor="w", padx=10, pady=(10, 0))
 
-        canvas = tk.Canvas(self, borderwidth=0)
-        style_canvas(canvas)
-        scroll_frame = tk.Frame(canvas); style_frame(scroll_frame)
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=scrollbar.set)
-
-        scrollbar.pack(side="right", fill="y")
-        canvas.pack(side="top", fill="both", expand=True, padx=10, pady=10)
-        canvas.create_window((0, 0), window=scroll_frame, anchor="nw")
-        scroll_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-        make_wheel_scrollable(canvas)
-
-        for i, item in enumerate(items):
-            track, candidate, score = item["track"], item["candidate"], item["score"]
-            row = tk.Frame(scroll_frame, relief="groove", borderwidth=1, highlightthickness=1)
-            style_row_frame(row)
-            row.pack(fill="x", pady=4, padx=2)
-
-            label_text = f"{track['artist']} - {track['title']}"
-            if candidate:
-                label_text += f"\nBest guess: \"{candidate['path'].name}\" (score {score:.2f})"
-            else:
-                label_text += "\nNo candidate found in the folder."
-            row_label = tk.Label(row, text=label_text, justify="left", anchor="w")
-            style_label(row_label)
-            row_label.pack(fill="x", padx=6, pady=(4, 2))
-
-            control_frame = tk.Frame(row); style_frame(control_frame)
-            control_frame.pack(fill="x", padx=6, pady=(0, 6))
-            path_entry = ThemedEntry(control_frame, textvariable=self.chosen_paths[i])
-            style_entry(path_entry)
-            path_entry.pack(side="left", fill="x", expand=True)
-            browse_btn = ThemedButton(control_frame, text="Browse...", command=lambda idx=i: self.browse_for(idx))
-            style_button(browse_btn)
-            browse_btn.pack(side="left", padx=(6, 6))
-            yt_btn = ThemedButton(control_frame, text="Search YouTube", command=lambda idx=i: self.search_youtube_for(idx))
-            style_button(yt_btn)
-            yt_btn.pack(side="left", padx=(0, 6))
-            skip_chk = ThemedCheckbutton(control_frame, text="Skip this track", variable=self.skip_flags[i])
-            style_checkbutton(skip_chk)
-            skip_chk.pack(side="left")
-            include_var = tk.BooleanVar(value=score < DownloadReviewWindow.FOUND_THRESHOLD)
-            include_chk = ThemedCheckbutton(control_frame, text="Include in Download All", variable=include_var)
-            style_checkbutton(include_chk)
-            include_chk.pack(side="left", padx=(6, 0))
-            self.include_vars[i] = include_var
-            self.include_checks[i] = include_chk
-
-            status_label = tk.Label(row, text="", justify="left", anchor="w")
-            style_label(status_label, subtle=True)
-            status_label.pack(fill="x", padx=6, pady=(0, 4))
-            self.status_labels[i] = status_label
-
         bottom = tk.Frame(self); style_frame(bottom)
-        bottom.pack(fill="x", padx=10, pady=10)
+        bottom.pack(side="bottom", fill="x", padx=10, pady=10)
         self.download_all_btn, self.cancel_btn = make_batch_controls(bottom, self.download_all, self.cancel_downloads)
-        finish_btn = ThemedButton(bottom, text="Finish & Save Playlist", command=self.finish, accent=True)
-        style_button(finish_btn)
-        finish_btn.pack(side="right")
+        ThemedButton(bottom, text="Finish & Save Playlist", command=self.finish, accent=True).pack(side="right")
         self.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.make_review_area()
+        self.show_page(0)
+
+    def build_row(self, i, parent):
+        item = self.items[i]
+        track, candidate, score = item["track"], item["candidate"], item["score"]
+        row = tk.Frame(parent, relief="groove", borderwidth=1, highlightthickness=1)
+        style_row_frame(row)
+        row.pack(fill="x", pady=4, padx=2)
+        label_text = f"{track['artist']} - {track['title']}"
+        if candidate:
+            label_text += f"\nBest guess: \"{candidate['path'].name}\" (score {score:.2f})"
+        else:
+            label_text += "\nNo candidate found in the folder."
+        row_label = tk.Label(row, text=label_text, justify="left", anchor="w")
+        style_label(row_label)
+        row_label.pack(fill="x", padx=6, pady=(4, 2))
+        control_frame = tk.Frame(row); style_frame(control_frame)
+        control_frame.pack(fill="x", padx=6, pady=(0, 6))
+        ThemedEntry(control_frame, textvariable=self.chosen_paths[i]).pack(side="left", fill="x", expand=True)
+        ThemedButton(control_frame, text="Browse...", command=lambda idx=i: self.browse_for(idx)).pack(side="left",
+                                                                                                    padx=(6, 6))
+        ThemedButton(control_frame, text="Search YouTube",
+                     command=lambda idx=i: self.search_youtube_for(idx)).pack(side="left", padx=(0, 6))
+        ThemedCheckbutton(control_frame, text="Skip", variable=self.skip_flags[i]).pack(side="left")
+        self.add_include_check(i, control_frame, padx=(6, 0))
+        self.add_status_label(i, row)
 
     def download_dir(self):
         return self.music_dir
@@ -4292,15 +4502,6 @@ class ReviewWindow(BatchDownloadMixin, tk.Toplevel):
 
     def on_batch_downloaded(self, idx, file_path):
         self.on_youtube_downloaded(idx, file_path)
-
-    def set_row_status(self, idx, text):
-        def update():
-            if idx in self.status_labels:
-                self.status_labels[idx].configure(text=text)
-        try:
-            self.after(0, update)
-        except (tk.TclError, RuntimeError):
-            pass  # window closed while a background job was still reporting
 
     def search_youtube_for(self, idx):
         if yt_dlp is None:
@@ -4332,7 +4533,7 @@ class ReviewWindow(BatchDownloadMixin, tk.Toplevel):
         self.set_row_status(idx, f"Downloaded: {file_path.name}")
         self.downloaded.add(idx)
         self.include_vars[idx].set(False)
-        self.include_checks[idx].configure(state="disabled")
+        self.set_include_state(idx, "disabled")
 
     def browse_for(self, idx):
         path = filedialog.askopenfilename(
@@ -4410,11 +4611,9 @@ class YouTubeResultsWindow(tk.Toplevel):
         l_query.pack(side="left", padx=(0, 6))
         self.query_var = tk.StringVar(value=f"{track['artist']} {track['title']}".strip())
         query_entry = ThemedEntry(query_row, textvariable=self.query_var)
-        style_entry(query_entry)
         query_entry.pack(side="left", fill="x", expand=True)
         query_entry.bind("<Return>", lambda e: self.new_search())
         search_btn = ThemedButton(query_row, text="Search", command=self.new_search)
-        style_button(search_btn)
         search_btn.pack(side="left", padx=(6, 0))
 
         # Scrollable results list
@@ -4436,7 +4635,6 @@ class YouTubeResultsWindow(tk.Toplevel):
         more_row = tk.Frame(self); style_frame(more_row)
         more_row.pack(fill="x", padx=10, pady=(4, 0))
         self.more_btn = ThemedButton(more_row, text="Show 5 More Results", command=self.show_more)
-        style_button(self.more_btn)
         self.more_btn.pack(side="left")
 
         desired_name = sanitize_filename(f"{track['artist']} - {track['title']}")
@@ -4451,10 +4649,8 @@ class YouTubeResultsWindow(tk.Toplevel):
         bottom = tk.Frame(self); style_frame(bottom)
         bottom.pack(fill="x", padx=10, pady=10)
         self.download_btn = ThemedButton(bottom, text="Download Selected", command=self.download_selected, accent=True)
-        style_button(self.download_btn)
         self.download_btn.pack(side="right")
         cancel_btn = ThemedButton(bottom, text="Cancel", command=self.destroy, width=10)
-        style_button(cancel_btn)
         cancel_btn.pack(side="right", padx=(0, 6))
 
     def render_results(self):
@@ -4845,7 +5041,7 @@ def write_library_playlists(groups, out_dir: Path, mode, nested, log, progress=N
     return summary
 
 
-class LibraryPlaylistPanel(tk.Frame):
+class LibraryPlaylistPanel(LogPanelMixin, tk.Frame):
     """Create Playlist tab, "From my music library" mode: scan a folder's
     tags, pick main genres (the rest become "Other Genres"), group by genre /
     year / artist / BPM, preview, then write .m3u8 playlists or copy the
@@ -5010,22 +5206,6 @@ class LibraryPlaylistPanel(tk.Frame):
         return ("One .m3u8 per playlist, with paths relative to the playlist file - keep playlists and music on "
                 "the same drive. Rekordbox: File > Import > Import Playlist.")
 
-    def log(self, message: str):
-        SESSION_LOG.write(log_source_name(self), message)
-        update_status_line(self, message)
-
-        def append():
-            self.log_box.configure(state="normal")
-            self.log_box.insert(tk.END, message + "\n")
-            self.log_box.see(tk.END)
-            self.log_box.configure(state="disabled")
-        try:
-            self.after(0, append)
-        except (tk.TclError, RuntimeError):
-            pass
-
-    # --- options ---
-
     def from_year(self):
         try:
             return int(self.from_year_var.get())
@@ -5185,7 +5365,8 @@ class LibraryPlaylistPanel(tk.Frame):
 
         def run():
             try:
-                summary = write_library_playlists(groups, out_dir, mode, nested, self.log, progress)
+                with KEEP_AWAKE:
+                    summary = write_library_playlists(groups, out_dir, mode, nested, self.log, progress)
                 self.after(0, lambda: self.create_finished(summary, out_dir, mode))
             except Exception as e:
                 self.log(f"ERROR: {e}")
@@ -5256,10 +5437,8 @@ class LibraryPreviewWindow(tk.Toplevel):
         bottom = tk.Frame(self); style_frame(bottom)
         bottom.pack(fill="x", padx=10, pady=10)
         create_btn = ThemedButton(bottom, text="Create", command=self.create, accent=True)
-        style_button(create_btn)
         create_btn.pack(side="right")
         cancel_btn = ThemedButton(bottom, text="Cancel", command=self.destroy, width=10)
-        style_button(cancel_btn)
         cancel_btn.pack(side="right", padx=(0, 6))
 
     def create(self):
@@ -5269,7 +5448,7 @@ class LibraryPreviewWindow(tk.Toplevel):
 
 # ---------- Tab 3: Metadata Editor ----------
 
-class MetadataEditorTab(tk.Frame):
+class MetadataEditorTab(LogPanelMixin, tk.Frame):
     def __init__(self, parent):
         super().__init__(parent)
         style_frame(self)
@@ -5326,20 +5505,6 @@ class MetadataEditorTab(tk.Frame):
         if requests is None or BeautifulSoup is None:
             self.log("NOTE: 'requests' and/or 'beautifulsoup4' are not installed - metadata lookup "
                       "won't work until you run: pip install requests beautifulsoup4")
-
-    def log(self, message: str):
-        SESSION_LOG.write(log_source_name(self), message)
-        update_status_line(self, message)
-
-        def append():
-            self.log_box.configure(state="normal")
-            self.log_box.insert(tk.END, message + "\n")
-            self.log_box.see(tk.END)
-            self.log_box.configure(state="disabled")
-        try:
-            self.after(0, append)
-        except (tk.TclError, RuntimeError):
-            pass
 
     def update_mode_label(self):
         mode = "on" if LARGE_LIBRARY_MODE else "off"
@@ -5443,13 +5608,12 @@ class MetadataEditorTab(tk.Frame):
             if self.stop_event.is_set():
                 return None
             try:
-                if skip_tagged or only_missing:
-                    reason = lookup_skip_reason(path, skip_tagged, only_missing)
-                    if reason:
-                        with lock:
-                            counts["skipped"] += 1
-                        return None
-                existing = read_existing_tags(path)
+                song = read_song_for_lookup(path)  # the only time the file is read
+                if (skip_tagged or only_missing) and lookup_skip_reason(song, skip_tagged, only_missing):
+                    with lock:
+                        counts["skipped"] += 1
+                    return None
+                existing = song["existing"]
                 title, artist = existing["title"], existing["artist"]
                 cached = None
                 if cache is not None:
@@ -5460,8 +5624,12 @@ class MetadataEditorTab(tk.Frame):
                     with lock:
                         counts["saved"] += 1
                 else:
-                    results, tried = lookup_metadata(source, artist, title, _audio_info(path)[0], self.log)
-                    if cache is not None:
+                    errors = []
+                    results, tried = lookup_metadata(source, artist, title, song["length"], self.log,
+                                                     errors=errors)
+                    # Only save complete answers - if a source failed (network drop, PC slept...),
+                    # this song is looked up again next scan instead of being remembered as "not found".
+                    if cache is not None and not errors:
                         cache.put(key, results, tried)
                 if results and results[0]["score"] >= METADATA_MIN_SCORE:
                     outcome = f"{results[0]['source']} ({results[0]['score']:.0%})"
@@ -5482,7 +5650,7 @@ class MetadataEditorTab(tk.Frame):
                 progress_tick()
 
         try:
-            with ThreadPoolExecutor(max_workers=LOOKUP_WORKERS if large else 1) as pool:
+            with KEEP_AWAKE, ThreadPoolExecutor(max_workers=LOOKUP_WORKERS if large else 1) as pool:
                 items = [it for it in pool.map(process, enumerate(files, 1)) if it]
 
             stopped = self.stop_event.is_set()
@@ -5498,7 +5666,8 @@ class MetadataEditorTab(tk.Frame):
                      + (f", {counts['skipped']} skipped by your filters" if counts["skipped"] else "")
                      + (f", {counts['saved']} from saved lookups" if counts["saved"] else "") + ".")
             if items:
-                review = LargeReviewWindow if large else MetadataReviewWindow
+                # The per-row review gets slow past a couple of hundred songs - use the table then.
+                review = LargeReviewWindow if large or len(items) > SMALL_REVIEW_LIMIT else MetadataReviewWindow
                 self.after(0, lambda: review(self, items, self.log))
             else:
                 self.after(0, lambda: messagebox.showinfo(
@@ -5601,14 +5770,12 @@ class MetadataReviewWindow(tk.Toplevel):
             self.choice_vars[i] = var
 
             apply_btn = ThemedButton(control_frame, text="Apply", command=lambda idx=i: self.apply_item(idx))
-            style_button(apply_btn)
             apply_btn.pack(side="left")
             self.apply_buttons[i] = apply_btn
 
             if lookup:
                 picker = ThemedOptionMenu(control_frame, var, *lookup.keys(), self.SKIP_CHOICE,
                                        command=lambda _value, idx=i: self.refresh_row(idx))
-                style_optionmenu(picker, picker["menu"])
                 picker.pack(side="left", fill="x", expand=True, padx=(6, 0))
 
             status_label = tk.Label(row, text="", justify="left", anchor="w")
@@ -5621,10 +5788,8 @@ class MetadataReviewWindow(tk.Toplevel):
         bottom = tk.Frame(self); style_frame(bottom)
         bottom.pack(fill="x", padx=10, pady=10)
         close_btn = ThemedButton(bottom, text="Close", command=self.destroy, width=12)
-        style_button(close_btn)
         close_btn.pack(side="right")
         self.apply_all_btn = ThemedButton(bottom, text="Apply All Selected", command=self.apply_all)
-        style_button(self.apply_all_btn)
         self.apply_all_btn.pack(side="right", padx=(0, 6))
         if found == 0:
             self.apply_all_btn.configure(state="disabled")
@@ -5724,8 +5889,10 @@ class MetadataReviewWindow(tk.Toplevel):
 
         def do_all():
             applied, failed = 0, 0
-            for i, chosen in jobs:
-                if self.write_item(i, chosen):
+            with KEEP_AWAKE:
+                outcomes = [self.write_item(i, chosen) for i, chosen in jobs]
+            for ok in outcomes:
+                if ok:
                     applied += 1
                 else:
                     failed += 1
@@ -5741,6 +5908,7 @@ class MetadataReviewWindow(tk.Toplevel):
 # ---------- Large library support (Metadata Editor) ----------
 
 LARGE_FOLDER_WARNING = 500   # songs - above this, suggest Large Library Mode if it's off
+SMALL_REVIEW_LIMIT = 150     # more songs than this always get the compact review table
 # Bump when lookup parsing/scoring changes, so answers saved by an older
 # version aren't reused (they'd carry the old mistakes).
 LOOKUP_CACHE_VERSION = 1
@@ -5757,6 +5925,12 @@ def apply_metadata_match(item, chosen, log):
     """Writes a lookup result's tags + cover art into a scanned file (the
     file's existing tags fill any gaps). Raises on failure. Returns a short
     status text for the GUI."""
+    if chosen.get("source") == "Deezer" and not chosen.get("_enriched"):
+        # Deezer alternatives only get their genre/label/date when picked.
+        try:
+            _enrich_deezer_result(chosen)
+        except Exception as e:
+            log(f"    Deezer details lookup failed: {e}")
     fields = merge_metadata_fields(chosen, existing_fields_of(item))
     image_bytes, image_mime = fetch_cover_art(chosen, log)
     if not image_bytes:
@@ -5770,12 +5944,43 @@ def apply_metadata_match(item, chosen, log):
     return "Applied - metadata updated (no cover image was available)."
 
 
-def lookup_skip_reason(path: Path, skip_tagged, only_missing):
-    """Why a file can be skipped by the scan's filters, or None to look it up."""
-    fields, image, _ = read_tags_and_cover(path)
-    if skip_tagged and fields.get("source") in METADATA_SEARCHERS:
+def read_song_for_lookup(path: Path):
+    """Everything a Tagging scan needs from a file in ONE read: its current
+    title/artist/album/genre (title/artist fall back to the filename, as in
+    read_existing_tags), its TrackMatch source tag, whether it has cover art,
+    and its length."""
+    try:
+        audio = MutagenFile(path)
+    except Exception:
+        audio = None
+    try:
+        fields, image, _ = read_tags_and_cover(path, audio) if audio is not None else ({}, None, None)
+    except Exception:
+        fields, image = {}, None
+    artists = fields.get("artist") or []
+    title, artist = fields.get("title") or "", artists[0] if artists else ""
+    if not title:
+        stem = path.stem
+        if " - " in stem:
+            guessed_artist, title = stem.split(" - ", 1)
+            artist = artist or guessed_artist
+        else:
+            title = stem
+    return {
+        "existing": {"title": title, "artist": artist, "album": fields.get("album", ""),
+                     "genre": fields.get("genre", "")},
+        "source": fields.get("source"),
+        "has_cover": bool(image),
+        "length": getattr(getattr(audio, "info", None), "length", None),
+    }
+
+
+def lookup_skip_reason(song, skip_tagged, only_missing):
+    """Why a file (from read_song_for_lookup) can be skipped by the scan's
+    filters, or None to look it up."""
+    if skip_tagged and song["source"] in METADATA_SEARCHERS:
         return "already tagged by TrackMatch"
-    if only_missing and fields.get("genre") and image:
+    if only_missing and song["existing"]["genre"] and song["has_cover"]:
         return "already has genre and cover art"
     return None
 
@@ -6004,10 +6209,8 @@ class CandidatePicker(tk.Toplevel):
         bottom = tk.Frame(self); style_frame(bottom)
         bottom.pack(fill="x", padx=12, pady=12)
         ok_btn = ThemedButton(bottom, text="Use This", command=self.ok, accent=True)
-        style_button(ok_btn)
         ok_btn.pack(side="right")
         cancel_btn = ThemedButton(bottom, text="Cancel", command=self.destroy, width=10)
-        style_button(cancel_btn)
         cancel_btn.pack(side="right", padx=(0, 6))
         self.grab_set()
 
@@ -6091,10 +6294,8 @@ class LargeReviewWindow(tk.Toplevel):
         bottom = tk.Frame(self); style_frame(bottom)
         bottom.pack(fill="x", padx=10, pady=(0, 10))
         self.apply_all_btn = ThemedButton(bottom, text="Apply All Selected Matches", command=self.apply_all, accent=True)
-        style_button(self.apply_all_btn)
         self.apply_all_btn.pack(side="left")
         self.apply_rows_btn = ThemedButton(bottom, text="Apply Highlighted Rows", command=self.apply_highlighted)
-        style_button(self.apply_rows_btn)
         self.apply_rows_btn.pack(side="left", padx=(6, 0))
         self.progress = ttk.Progressbar(bottom, mode="determinate")
         self.progress.pack(side="left", fill="x", expand=True, padx=10)
@@ -6102,7 +6303,6 @@ class LargeReviewWindow(tk.Toplevel):
         style_label(self.progress_label, subtle=True)
         self.progress_label.pack(side="left")
         close_btn = ThemedButton(bottom, text="Close", command=self.close, width=10)
-        style_button(close_btn)
         close_btn.pack(side="right")
         self.protocol("WM_DELETE_WINDOW", self.close)
 
@@ -6235,7 +6435,7 @@ class LargeReviewWindow(tk.Toplevel):
                         self.progress_label.configure(text=f"{done}/{len(jobs)}")))
 
         def run():
-            with ThreadPoolExecutor(max_workers=LOOKUP_WORKERS) as pool:
+            with KEEP_AWAKE, ThreadPoolExecutor(max_workers=LOOKUP_WORKERS) as pool:
                 list(pool.map(one, jobs))
             self.log(f"Apply complete: {counter['ok']} updated, {counter['failed']} failed.")
             ui(self.apply_finished(counter))
@@ -6263,7 +6463,7 @@ class LargeReviewWindow(tk.Toplevel):
 
 # ---------- Tab 4: Convert Audio ----------
 
-class ConvertAudioTab(tk.Frame):
+class ConvertAudioTab(LogPanelMixin, tk.Frame):
     """Converts a folder of songs to another format (see AudioConverter),
     with "Use for" presets, a live quality/compatibility note, and a
     confirmation showing sizes and how many CDs the result fills."""
@@ -6373,20 +6573,6 @@ class ConvertAudioTab(tk.Frame):
                 "Rekordbox / Serato / Traktor treat them as new tracks, so cue points, hot cues, beat grids, play "
                 "counts and playlist entries stay with the old files, and .m3u8 playlists keep pointing at the old "
                 "files. Existing files are never overwritten.")
-
-    def log(self, message: str):
-        SESSION_LOG.write(log_source_name(self), message)
-        update_status_line(self, message)
-
-        def append():
-            self.log_box.configure(state="normal")
-            self.log_box.insert(tk.END, message + "\n")
-            self.log_box.see(tk.END)
-            self.log_box.configure(state="disabled")
-        try:
-            self.after(0, append)
-        except (tk.TclError, RuntimeError):
-            pass
 
     def apply_preset(self):
         """Fills in the target format/bitrate for the chosen "Use for"
@@ -6611,6 +6797,17 @@ class SettingsTab(tk.Frame):
                                "tagging downloads); anything lower is left as \"Don't change\" for you to check.\n\n"
                                "75% still requires the artist and version to match - higher settings also hold back "
                                "small spelling or length differences.", "Minimum match").pack(side="left")
+        cover_row = tk.Frame(tagging); style_frame(cover_row)
+        cover_row.pack(fill="x", pady=(8, 0))
+        self.cover_fallback_var = tk.BooleanVar(value=COVER_FALLBACK)
+        ThemedCheckbutton(cover_row, text="Find missing covers on iTunes", variable=self.cover_fallback_var,
+                          command=lambda: set_cover_fallback(self.cover_fallback_var.get())).pack(side="left")
+        info_button(cover_row, "When the matched source's cover can't be downloaded (Deezer's image server blocks "
+                               "some connections), look the same album up on iTunes and use its artwork.\n\n"
+                               "iTunes allows only about 20 lookups a minute, so with lots of songs this can slow "
+                               "applying down (each album is only looked up once per session). Turn it off to skip "
+                               "those covers - the songs keep whatever cover they already have.",
+                    "Find missing covers").pack(side="left", padx=(4, 0))
         saved_row = tk.Frame(tagging); style_frame(saved_row)
         saved_row.pack(fill="x", pady=(8, 0))
         self.saved_label = tk.Label(saved_row, text="Saved lookups")
