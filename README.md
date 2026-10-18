@@ -104,4 +104,4 @@ This tool uses `yt-dlp` to fetch audio from YouTube for tracks missing from your
 
 ## License
 
-No license as of yet
+Copyright (C) 2026 Basil-Black. TrackMatch is free software, released under the [GNU General Public License v3.0](LICENSE): you can use, change and share it, as long as anything you share based on it stays under the same license.

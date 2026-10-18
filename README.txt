@@ -197,3 +197,10 @@ TROUBLESHOOTING
 - Something else went wrong:
     Settings > Open logs folder. The newest log file has the details -
     include it when reporting a problem on GitHub.
+
+
+License
+-------
+Copyright (C) 2026 Basil-Black. TrackMatch is free software, released
+under the GNU General Public License v3.0 - see the LICENSE file or
+https://www.gnu.org/licenses/gpl-3.0.html
