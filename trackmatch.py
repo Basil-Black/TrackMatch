@@ -1123,6 +1123,31 @@ def best_ratio(a: str, b: str) -> float:
     return max(direct, sorted_ratio)
 
 
+# Below these, a high title+artist score still isn't the same song: a
+# featured artist alone matching ("Bodyrox ft. Luciana" vs a different
+# "Yeah Yeah" Luciana sang on), or the same artist with a loosely similar
+# title ("The Game of Love" vs "One More Time").
+SAME_SONG_TITLE_MIN = 0.8
+SAME_SONG_ARTIST_MIN = 0.85
+# A playlist song's best guess at least this good counts as already in the folder
+FOUND_THRESHOLD = 0.75
+
+
+def primary_artist(text: str) -> str:
+    """The first-named artist, normalized - 'Bodyrox ft. Luciana' -> 'bodyrox'."""
+    return next((n for n in (normalize(p) for p in ARTIST_SPLIT_RE.split(text)) if n), "")
+
+
+def is_same_song(target_title, target_artist, candidate_title, candidate_artist_set) -> bool:
+    """Whether a candidate can be the song at all: its title is close and it
+    credits the song's main artist (not just a featured one). Titles are
+    normalized; target_artist is the raw artist string."""
+    main = primary_artist(target_artist)
+    return (best_ratio(target_title, candidate_title) >= SAME_SONG_TITLE_MIN
+            and bool(main)
+            and max((best_ratio(main, b) for b in candidate_artist_set), default=0.0) >= SAME_SONG_ARTIST_MIN)
+
+
 def find_column(fieldnames, candidates):
     """Case-insensitive match of a candidate column name against the CSV header."""
     lower_map = {f.lower().strip(): f for f in fieldnames}
@@ -1326,6 +1351,9 @@ def find_best_match(track, index):
     best_candidate, best_score = None, 0.0
     for candidate in pool:
         score = score_match(norm_title, target_artist_set, candidate)
+        if not is_same_song(norm_title, track["artist"], candidate["norm_title"], candidate["artist_set"]):
+            # Can still be offered as a guess, but never counts as found
+            score = min(score, FOUND_THRESHOLD - 0.05)
         if score > best_score:
             best_candidate, best_score = candidate, score
 
@@ -1972,9 +2000,10 @@ def score_metadata_result(artist: str, title: str, result, length=None) -> float
     never_confident = False
     if target_artists:
         score = score_match(normalize(title), target_artists, candidate)
-        best_artist = max((best_ratio(a, b) for a in target_artists for b in candidate["artist_set"]), default=0.0)
-        # e.g. a cover, a cast recording, "Killer Queen" vs "Queen"
-        never_confident = best_artist < 0.85
+        # e.g. a cover, a cast recording, "Killer Queen" vs "Queen", or a
+        # different song that only shares a featured artist
+        never_confident = not is_same_song(normalize(title), ARTIST_DISAMBIGUATOR_RE.sub("", artist or ""),
+                                           candidate["norm_title"], candidate["artist_set"])
     else:
         # Nothing to compare artists against (untagged file with no
         # "Artist - Title" filename).
@@ -2134,11 +2163,18 @@ def _get_json(url, params, limiter, service):
     raise RuntimeError(f"{service} kept refusing requests - try again in a few minutes")
 
 
+# The same version words in square brackets - iTunes often writes remixes as
+# "Yeah Yeah (feat. Luciana) [D. Ramirez Vocal Club Mix]"
+MIX_SUFFIX_BRACKET_RE = re.compile(MIX_SUFFIX_RE.pattern.replace(r"\(", r"\[").replace(r"\)", r"\]")
+                                   .replace("[^()]", r"[^\[\]]"), re.IGNORECASE)
+
+
 def _split_title_version(title):
-    """'Blinding Lights (Remix)' -> ('Blinding Lights', 'Remix')."""
-    versions = MIX_SUFFIX_RE.findall(title or "")
-    base = MIX_SUFFIX_RE.sub("", title or "").strip()
-    return base or title, " ".join(v.strip("() ") for v in versions)
+    """'Blinding Lights (Remix)' -> ('Blinding Lights', 'Remix'); also '[Remix]'."""
+    title = title or ""
+    versions = MIX_SUFFIX_RE.findall(title) + MIX_SUFFIX_BRACKET_RE.findall(title)
+    base = MIX_SUFFIX_BRACKET_RE.sub("", MIX_SUFFIX_RE.sub("", title)).strip()
+    return base or title, " ".join(v.strip("()[] ") for v in versions)
 
 
 def _parse_deezer_track(t):
@@ -4110,8 +4146,6 @@ class DownloadReviewWindow(PagedReviewMixin, BatchDownloadMixin, tk.Toplevel):
     Nothing here builds a playlist - it's purely about filling gaps in
     your library."""
 
-    FOUND_THRESHOLD = 0.75
-
     def __init__(self, parent, items, dest_dir, dl_opts, log):
         super().__init__(parent)
         self.title("TrackMatch - Download Review")
@@ -4131,7 +4165,7 @@ class DownloadReviewWindow(PagedReviewMixin, BatchDownloadMixin, tk.Toplevel):
         self.include_vars = {}
         for i, item in enumerate(items):
             candidate, score = item["candidate"], item["score"]
-            if candidate and score >= self.FOUND_THRESHOLD:
+            if candidate and score >= FOUND_THRESHOLD:
                 self.match_text[i] = f"Found: \"{candidate['path'].name}\" (score {score:.2f})"
                 self.match_kinds[i] = "found"
             elif candidate:
@@ -4141,12 +4175,12 @@ class DownloadReviewWindow(PagedReviewMixin, BatchDownloadMixin, tk.Toplevel):
             else:
                 self.match_text[i] = "Not found in the folder"
                 self.match_kinds[i] = "missing"
-            self.include_vars[i] = tk.BooleanVar(value=score < self.FOUND_THRESHOLD)
+            self.include_vars[i] = tk.BooleanVar(value=score < FOUND_THRESHOLD)
 
-        found = sum(1 for it in items if it["score"] >= self.FOUND_THRESHOLD)
+        found = sum(1 for it in items if it["score"] >= FOUND_THRESHOLD)
         header = tk.Label(
             self,
-            text=f"{found}/{len(items)} already look present (score >= {self.FOUND_THRESHOLD:.2f}). "
+            text=f"{found}/{len(items)} already look present (score >= {FOUND_THRESHOLD:.2f}). "
                  f"Missing/uncertain tracks are listed first and ticked for Download All - it picks the "
                  f"best YouTube result for each automatically, and leaves any without a confident match "
                  f"for you to pick with Search YouTube.\nSaving to: {dest_dir}   ({dl_opts.describe()})",
@@ -4446,15 +4480,16 @@ class ReviewWindow(PagedReviewMixin, BatchDownloadMixin, tk.Toplevel):
             tk.StringVar(value=str(it["candidate"]["path"]) if it["candidate"] else "")
             for it in items
         ]
-        self.skip_flags = [tk.BooleanVar(value=False) for _ in items]
-        self.include_vars = {i: tk.BooleanVar(value=it["score"] < DownloadReviewWindow.FOUND_THRESHOLD)
+        # Weak guesses are left out unless picked by hand (Browse or a download un-skips them)
+        self.skip_flags = [tk.BooleanVar(value=it["score"] < FOUND_THRESHOLD) for it in items]
+        self.include_vars = {i: tk.BooleanVar(value=it["score"] < FOUND_THRESHOLD)
                              for i, it in enumerate(items)}
         self.downloaded = set()  # rows filled by a YouTube download
 
         header = tk.Label(
             self,
             text=f"Reviewing all {len(items)} tracks, worst matches first. Confirm, fix, or skip each one - "
-                 f"nothing is saved until you click Finish.",
+                 f"nothing is saved until you click Finish. Weak guesses start skipped - untick Skip to keep one.",
             justify="left", wraplength=770
         )
         style_label(header, subtle=True)
@@ -5911,7 +5946,7 @@ LARGE_FOLDER_WARNING = 500   # songs - above this, suggest Large Library Mode if
 SMALL_REVIEW_LIMIT = 150     # more songs than this always get the compact review table
 # Bump when lookup parsing/scoring changes, so answers saved by an older
 # version aren't reused (they'd carry the old mistakes).
-LOOKUP_CACHE_VERSION = 1
+LOOKUP_CACHE_VERSION = 2
 LOOKUP_WORKERS = 3           # songs looked up at once in Large Library Mode
 
 
