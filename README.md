@@ -55,6 +55,8 @@ Paste a link, browse to a file, or paste a list of songs. No accounts or API key
 
 **Prebuilt app (Windows):** download the latest `TrackMatch-vX.X.X.zip` from the [Releases page](https://github.com/Basil-Black/TrackMatch/releases/latest), extract the zip and run `TrackMatch.exe`. Keep `icon.ico` and `icon.png` next to it. If Windows shows "Windows protected your PC", click **More info** > **Run anyway** (this appears for any app that isn't signed with a paid certificate).
 
+**Android:** there's also an Android version - get the APK from [TrackMatch-Android](https://github.com/Basil-Black/TrackMatch-Android/releases/latest).
+
 **ffmpeg** is needed for downloading and converting (matching and playlists work without it):
 - Windows: `winget install ffmpeg`
 - macOS: `brew install ffmpeg`
