@@ -26,13 +26,13 @@ Looks up every song in a folder and fills in **cover art, genre, label, year and
 - **Large library mode** (in Settings) handles thousands of songs: 3 lookups at a time, progress saved as it goes so scans can be stopped and resumed, and a compact review table.
 - Each tagged file gets a hidden tag recording where its metadata came from, so already-tagged songs can be skipped next time.
 - **Fix file names** renames songs to "Artist - Title" from their tags and updates the playlists in the folder.
-- **Make formats consistent** turns every song that isn't m4a into m4a: flac/wav/aiff and .aac are converted, and low-bitrate mp3s (and other lossy files) can be **downloaded again from YouTube** instead of re-encoded. You pick per song; tags, cover art and file names are kept, originals go to the Recycle Bin and playlists are updated.
 
 ### Convert
 Converts a folder of songs between **mp3, m4a, flac, wav and aiff**, keeping tags and cover art.
 - **Use for** presets: Audio CD burning, MP3 CD for car / CD player, older CDJ / USB player, iPhone / iTunes, DJ software (aiff from wav/flac), archiving (flac).
 - Clear quality notes (lossy to lossy loses a little quality, lossy to lossless gains nothing) and a confirmation showing the size before and after, and how many audio CDs or MP3 CDs the result fills.
 - Originals are never overwritten, and can optionally be moved to the Recycle Bin / Trash after a successful conversion.
+- **Converting to m4a**: low-bitrate mp3s (and other lossy files) can be **downloaded again from YouTube** instead of re-encoded. You review every song first and pick Download, Convert or Skip (or Convert All / Download All Found); flac/wav/aiff and .aac are always converted. Tags, cover art and file names are kept, and playlists in the folder are updated when the m4a is saved next to the original.
 
 ### Settings
 Dark or light mode, a custom **accent colour**, YouTube cookies (for age-restricted videos), Large library mode, the **minimum match** needed for automatic tagging, and whether to show the log panels.
