@@ -1103,6 +1103,13 @@ def sanitize_filename(name: str) -> str:
     return name or "Untitled"
 
 
+def sanitize_playlist_name(name: str) -> str:
+    """sanitize_filename for playlist and folder names: '/' becomes ' - ', so
+    "Rap/Hip Hop" saves as "Rap - Hip Hop" rather than "RapHip Hop". Song
+    file names keep the plain rule, so "AC/DC" doesn't become "AC - DC"."""
+    return sanitize_filename(name.replace("/", " - "))
+
+
 def token_sort(text: str) -> str:
     """Word order shouldn't matter (e.g. filename is 'Title - Artist' instead of
     'Artist - Title') so compare sorted word sets as a second pass."""
@@ -5036,13 +5043,13 @@ def write_library_playlists(groups, out_dir: Path, mode, nested, log, progress=N
             break
         name = playlist_name(parts)
         if mode == "m3u":
-            path = out_dir / f"{sanitize_filename(name)}.m3u8"
+            path = out_dir / f"{sanitize_playlist_name(name)}.m3u8"
             write_m3u(path, members)
             log(f"  {path.name}: {len(members)} songs")
             done += len(members)
         else:
-            folder = out_dir.joinpath(*(sanitize_filename(p) for p in parts)) if nested \
-                else out_dir / sanitize_filename(name)
+            folder = out_dir.joinpath(*(sanitize_playlist_name(p) for p in parts)) if nested \
+                else out_dir / sanitize_playlist_name(name)
             folder.mkdir(parents=True, exist_ok=True)
             used = set()
             for s in members:
@@ -5466,7 +5473,8 @@ class LibraryPreviewWindow(tk.Toplevel):
         scrollbar.pack(side="right", fill="y")
         tree.pack(side="left", fill="both", expand=True)
         for parts, members in sorted(groups.items(), key=lambda kv: [p.lower() for p in kv[0]]):
-            label = "/".join(parts) + "/" if nested else playlist_name(parts) + ("" if mode == "copy" else ".m3u8")
+            label = "/".join(sanitize_playlist_name(p) for p in parts) + "/" if nested \
+                else sanitize_playlist_name(playlist_name(parts)) + ("" if mode == "copy" else ".m3u8")
             tree.insert("", "end", values=(label, len(members)))
 
         bottom = tk.Frame(self); style_frame(bottom)
@@ -5528,6 +5536,25 @@ class MetadataEditorTab(LogPanelMixin, tk.Frame):
         SETTING_LISTENERS.append(self.update_mode_label)
         self.update_mode_label()
 
+        names = make_section(self, "Fix file names",
+                             "Renames songs to \"Artist - Title\" from their own tags - several artists are joined "
+                             "with \", \", the same way Grab names downloads. You see every change first, and an "
+                             "existing file is never overwritten.\n\n.m3u / .m3u8 playlists in the folder (and its "
+                             "subfolders) are updated to the new names; playlists saved anywhere else keep the old "
+                             "ones. Rekordbox, Serato and Traktor show renamed songs as missing until you relocate "
+                             "them.\n\nThe new name comes from the tags, so tag any wrongly tagged songs first.")
+        names_text = tk.Label(names, text="Gives every song in the music folder above an \"Artist - Title\" file "
+                                          "name from its tags.", justify="left", anchor="w", wraplength=680)
+        style_label(names_text, subtle=True)
+        names_text.pack(fill="x")
+        names_row = tk.Frame(names); style_frame(names_row)
+        names_row.pack(fill="x", pady=(6, 0))
+        self.names_button = ThemedButton(names_row, text="Check File Names", command=self.check_names_clicked)
+        self.names_button.pack(side="left")
+        self.names_status = tk.Label(names_row, text="", anchor="w")
+        style_label(self.names_status, subtle=True)
+        self.names_status.pack(side="left", padx=(8, 0))
+
         log_label = tk.Label(self, text="Log:"); style_label(log_label)
         log_label.pack(anchor="w", padx=12, pady=(8, 0))
         self.log_box = ThemedScrolledText(self, height=16, state="disabled", wrap="word")
@@ -5545,6 +5572,51 @@ class MetadataEditorTab(LogPanelMixin, tk.Frame):
         mode = "on" if LARGE_LIBRARY_MODE else "off"
         self.mode_label.configure(text=f"Large library mode {mode}  \u00b7  Minimum match {METADATA_MIN_SCORE:.0%}"
                                        f"  \u00b7  change these in Settings")
+
+    def check_names_clicked(self):
+        folder = self.folder_entry.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showerror("Missing info", "Choose a valid music folder.")
+            return
+        if not MutagenFile:
+            messagebox.showerror("Missing dependency", "Install requirements first:\npip install mutagen")
+            return
+        self.names_button.configure(state="disabled")
+        self.names_status.configure(text="Reading tags...")
+
+        def progress(done, total):
+            try:
+                self.after(0, lambda: self.names_status.configure(text=f"Reading tags... {done}/{total}"))
+            except (tk.TclError, RuntimeError):
+                pass
+
+        def run():
+            try:
+                items = scan_file_names(Path(folder), progress)
+                self.after(0, lambda: self.names_checked(Path(folder), items))
+            except Exception as e:
+                self.after(0, lambda err=e: (self.names_button.configure(state="normal"),
+                                             self.names_status.configure(text=""),
+                                             messagebox.showerror("Error", str(err))))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def names_checked(self, folder, items):
+        self.names_button.configure(state="normal")
+        counts = {}
+        for it in items:
+            counts[it["status"]] = counts.get(it["status"], 0) + 1
+        problems = len(items) - counts.get("rename", 0) - counts.get("ok", 0)
+        summary = (f"{counts.get('rename', 0)} to rename, {counts.get('ok', 0)} already right"
+                   + (f", {problems} can't be fixed" if problems else ""))
+        self.names_status.configure(text=summary)
+        self.log(f"\nChecked file names in {folder}: {summary}.")
+        if not items:
+            messagebox.showinfo("No songs", f"No audio files found in:\n{folder}")
+        elif not counts.get("rename") and not problems:
+            messagebox.showinfo("File names", f"All {len(items)} songs already have \"Artist - Title\" file names.")
+        else:
+            FileNameReviewWindow(self, folder, items, self.log)
 
     def run_clicked(self):
         folder = self.folder_entry.get().strip()
@@ -5715,6 +5787,316 @@ class MetadataEditorTab(LogPanelMixin, tk.Frame):
         finally:
             self.after(0, self.scan_finished)
             self.after(0, lambda: self.progress.configure(value=0))
+
+
+def read_name_tags(path: Path):
+    """(artists, title) straight from the tags, every artist value kept. No
+    file name fallback - the file name is what's being fixed."""
+    artists, title = [], ""
+    try:
+        audio = MutagenFile(path, easy=True)
+    except Exception:
+        audio = None
+    tags = getattr(audio, "tags", None) if audio is not None else None
+    if tags is not None:
+        if isinstance(tags, ID3):  # wav/aiff have no "easy" mode - read the frames directly
+            artist_frame, title_frame = tags.get("TPE1"), tags.get("TIT2")
+            artists = list(artist_frame.text) if artist_frame is not None else []
+            title = title_frame.text[0] if title_frame is not None and title_frame.text else ""
+        else:
+            try:
+                artists = list(tags.get("artist") or [])
+                title = _first_value(tags.get("title"))
+            except (KeyError, ValueError):
+                pass
+    return [str(a).strip() for a in artists if str(a).strip()], str(title).strip()
+
+
+def tag_file_name(artists, title, extension):
+    """The "Artist - Title" name a song's tags give it, named like Grab names
+    downloads: several artists joined with ", ", then sanitize_filename. None
+    when the tags have no artist or no title."""
+    artists = [a.strip() for a in artists if a.strip()]
+    title = title.strip()
+    if not artists or not title:
+        return None
+    return sanitize_filename(f"{', '.join(artists)} - {title}") + extension
+
+
+RENAME_PROBLEMS = {
+    "no_tags": "no artist or title tag",
+    "taken": "another file already has that name",
+    "duplicate": "another song in this folder would get the same name",
+}
+
+
+def plan_renames(songs, taken):
+    """songs: [(folder, file name, artists, title)]. taken: {folder: lowercased
+    names of every file in it}. Returns (status, new name) per song - status
+    "rename", "ok" (already right) or a RENAME_PROBLEMS key. Only the first of
+    several songs wanting the same name gets it; a case-only change is fine."""
+    plan, claimed = [], set()
+    for folder, name, artists, title in songs:
+        new = tag_file_name(artists, title, os.path.splitext(name)[1])
+        if new is None:
+            plan.append(("no_tags", None))
+        elif new == name:
+            plan.append(("ok", new))
+        elif (folder, new.lower()) in claimed:
+            plan.append(("duplicate", new))
+        elif new.lower() != name.lower() and new.lower() in taken.get(folder, set()):
+            plan.append(("taken", new))
+        else:
+            claimed.add((folder, new.lower()))
+            plan.append(("rename", new))
+    return plan
+
+
+def scan_file_names(folder: Path, progress=None):
+    """Reads the artist and title of every song in folder (and subfolders) and
+    plans its new name. Returns [{"path", "status", "new"}] in path order."""
+    files = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS)
+    taken = {d: {c.name.lower() for c in d.iterdir()} for d in {p.parent for p in files}}
+    done = [0]
+    lock = threading.Lock()
+
+    def read(path):
+        tags = read_name_tags(path)
+        with lock:
+            done[0] += 1
+            if progress and done[0] % 50 == 0:
+                progress(done[0], len(files))
+        return tags
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        tags = list(pool.map(read, files))
+    plan = plan_renames([(p.parent, p.name, a, t) for p, (a, t) in zip(files, tags)], taken)
+    return [{"path": p, "status": status, "new": new} for p, (status, new) in zip(files, plan)]
+
+
+def update_playlist_entries(text, resolve, renamed):
+    """Points a playlist's entries at renamed songs. resolve(entry) gives the
+    key of the file an entry points at and renamed maps those keys to new
+    names. Only the last part of a changed entry is swapped, so the rest of the
+    line (relative or full path, slashes, line ending) stays as it was.
+    Returns (new text, entries changed)."""
+    lines, changed = [], 0
+    for line in re.split(r"(?<=\n)", text):
+        body = line.rstrip("\r\n")
+        entry = body.strip()
+        if entry and not entry.startswith("#"):
+            new = renamed.get(resolve(entry))
+            if new:
+                cut = max(body.rfind("/"), body.rfind("\\")) + 1
+                line = body[:cut] + new + line[len(body):]
+                changed += 1
+        lines.append(line)
+    return "".join(lines), changed
+
+
+def path_key(path):
+    return os.path.normcase(os.path.normpath(path))
+
+
+def update_playlists_for_renames(folder: Path, renamed, log):
+    """Rewrites the .m3u / .m3u8 playlists in folder (and subfolders) that
+    list a renamed song. renamed maps path_key(old path) to the new name.
+    Keeps each playlist's encoding. Returns how many were updated."""
+    updated = 0
+    for playlist in sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in (".m3u", ".m3u8")):
+        try:
+            raw = playlist.read_bytes()
+            encoding = "utf-8-sig" if raw.startswith(b"\xef\xbb\xbf") else "utf-8"
+            try:
+                text = raw.decode(encoding)
+            except UnicodeDecodeError:
+                encoding = "cp1252"  # an older .m3u saved in the Windows encoding
+                text = raw.decode(encoding)
+
+            def resolve(entry):
+                path = Path(entry.replace("\\", "/"))
+                return path_key(path if path.is_absolute() else playlist.parent / path)
+
+            new_text, changed = update_playlist_entries(text, resolve, renamed)
+            if changed:
+                tmp = playlist.with_name(playlist.name + ".updating")
+                tmp.write_bytes(new_text.encode(encoding))
+                os.replace(tmp, playlist)
+                updated += 1
+                log(f"  Updated playlist {playlist.name}: {changed} song{plural(changed)}")
+        except (OSError, UnicodeError) as e:
+            log(f"  Couldn't update playlist {playlist.name}: {e}")
+    return updated
+
+
+def plural(n):
+    return "" if n == 1 else "s"
+
+
+class FileNameReviewWindow(tk.Toplevel):
+    """Lists the songs whose file names would change (now -> new, each with
+    a tick) and, under them, the ones that can't be fixed and why. Nothing
+    is renamed until Rename is clicked."""
+
+    TICK, UNTICK = "☑", "☐"
+
+    def __init__(self, parent, folder, items, log):
+        super().__init__(parent)
+        self.title("TrackMatch - Fix File Names")
+        self.geometry("900x620")
+        style_window(self)
+        set_window_icon(self, ICON_PATH)
+        enable_dark_titlebar(self)
+        self.folder, self.log = folder, log
+        self.renames = [it for it in items if it["status"] == "rename"]
+        self.problems = [it for it in items if it["status"] in RENAME_PROBLEMS]
+        self.ticked = set(range(len(self.renames)))
+        self.renaming = False
+
+        ok = sum(1 for it in items if it["status"] == "ok")
+        header = tk.Label(
+            self,
+            text=f"{len(self.renames)} song{plural(len(self.renames))} will get \"Artist - Title\" names from their tags"
+                 + (f", {ok} already right" if ok else "")
+                 + (f", {len(self.problems)} can't be fixed (listed at the bottom)" if self.problems else "")
+                 + ". Click a row to untick it. Playlists in this folder are updated to the new names. Nothing "
+                   "is renamed until you click Rename.",
+            justify="left", wraplength=860)
+        style_label(header, subtle=True)
+        header.pack(anchor="w", padx=10, pady=(10, 6))
+
+        table = tk.Frame(self); style_frame(table)
+        table.pack(fill="both", expand=True, padx=10)
+        self.tree = ttk.Treeview(table, columns=("tick", "file", "new"), show="headings", selectmode="extended")
+        for key, title, width in (("tick", "", 30), ("file", "Now", 420), ("new", "New name", 420)):
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, stretch=key != "tick", anchor="center" if key == "tick" else "w")
+        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        register(lambda: (self.tree.tag_configure("check", foreground=THEME["MISSING_FG"]),
+                          self.tree.tag_configure("done", foreground=THEME["FOUND_FG"]),
+                          self.tree.tag_configure("failed", foreground=THEME["MISSING_FG"])))
+        for i, it in enumerate(self.renames):
+            self.tree.insert("", "end", iid=str(i), values=(self.TICK, self.shown(it["path"]), it["new"]))
+        for it in self.problems:
+            new = f"{it['new']}  " if it["new"] else ""
+            self.tree.insert("", "end", values=("", self.shown(it["path"]),
+                                                f"{new}(left as is - {RENAME_PROBLEMS[it['status']]})"),
+                             tags=("check",))
+        self.tree.bind("<ButtonRelease-1>", self.clicked)
+        self.tree.bind("<space>", lambda e: self.toggle(self.tree.selection()))
+
+        bottom = tk.Frame(self); style_frame(bottom)
+        bottom.pack(fill="x", padx=10, pady=10)
+        self.rename_btn = ThemedButton(bottom, text="", command=self.rename, accent=True)
+        self.rename_btn.pack(side="left")
+        self.all_btn = ThemedButton(bottom, text="Tick All", command=lambda: self.set_all(True))
+        self.all_btn.pack(side="left", padx=(6, 0))
+        self.none_btn = ThemedButton(bottom, text="Untick All", command=lambda: self.set_all(False))
+        self.none_btn.pack(side="left", padx=(6, 0))
+        self.status = tk.Label(bottom, text="", anchor="w")
+        style_label(self.status, subtle=True)
+        self.status.pack(side="left", fill="x", expand=True, padx=10)
+        ThemedButton(bottom, text="Close", command=self.close, width=10).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.update_button()
+
+    def shown(self, path):
+        try:
+            return path.relative_to(self.folder).as_posix()
+        except ValueError:
+            return path.name
+
+    def update_button(self):
+        self.rename_btn.configure(text=f"Rename {len(self.ticked)} Song{plural(len(self.ticked))}",
+                                  state="normal" if self.ticked and not self.renaming else "disabled")
+
+    def clicked(self, event):
+        if self.tree.identify_region(event.x, event.y) == "cell":
+            row = self.tree.identify_row(event.y)
+            if row:
+                self.toggle([row])
+
+    def toggle(self, rows):
+        if self.renaming:
+            return
+        for row in rows:
+            if row.isdigit() and "done" not in self.tree.item(row, "tags"):
+                i = int(row)
+                self.ticked.symmetric_difference_update({i})
+                self.tree.set(row, "tick", self.TICK if i in self.ticked else self.UNTICK)
+        self.update_button()
+
+    def set_all(self, ticked):
+        if self.renaming:
+            return
+        for i in range(len(self.renames)):
+            if "done" in self.tree.item(str(i), "tags"):
+                continue
+            self.ticked.discard(i)
+            if ticked:
+                self.ticked.add(i)
+            self.tree.set(str(i), "tick", self.TICK if ticked else self.UNTICK)
+        self.update_button()
+
+    def rename(self):
+        jobs = sorted(self.ticked)
+        if not jobs:
+            return
+        self.renaming = True
+        self.update_button()
+        self.status.configure(text="Renaming...")
+        self.log(f"Renaming {len(jobs)} songs...")
+
+        def run():
+            renamed, failed = {}, 0
+            for n, i in enumerate(jobs, 1):
+                src = self.renames[i]["path"]
+                dest = src.with_name(self.renames[i]["new"])
+                try:
+                    # samefile: a case-only change ("fisher - x" -> "FISHER - X") is the same file
+                    if dest.exists() and not dest.samefile(src):
+                        raise FileExistsError("a file with that name is already there")
+                    src.rename(dest)
+                    renamed[path_key(src)] = dest.name
+                    self.renames[i]["path"] = dest
+                    result = ("done", "✓", None)
+                    self.log(f"  {src.name} -> {dest.name}")
+                except OSError as e:
+                    failed += 1
+                    result = ("failed", "!", f"{dest.name}  (couldn't rename: {e})")
+                    self.log(f"  Couldn't rename {src.name}: {e}")
+                self.after(0, lambda i=i, r=result, n=n: self.row_done(i, r, n, len(jobs)))
+            playlists = update_playlists_for_renames(self.folder, renamed, self.log) if renamed else 0
+            text = (f"Renamed {len(renamed)} song{plural(len(renamed))}" + (f", {failed} failed" if failed else "")
+                    + f", updated {playlists} playlist{plural(playlists)}.")
+            self.log(text)
+            self.after(0, lambda: self.finished(text))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def row_done(self, i, result, n, total):
+        tag, tick, new = result
+        self.ticked.discard(i)
+        self.tree.item(str(i), tags=(tag,))
+        self.tree.set(str(i), "tick", tick)
+        if new:
+            self.tree.set(str(i), "new", new)
+        self.status.configure(text=f"Renaming... {n}/{total}")
+
+    def finished(self, text):
+        self.renaming = False
+        self.status.configure(text=text)
+        self.update_button()
+
+    def close(self):
+        if self.renaming:
+            messagebox.showinfo("Still renaming", "Songs are still being renamed - this only takes a moment.",
+                                parent=self)
+            return
+        self.destroy()
 
 
 class MetadataReviewWindow(tk.Toplevel):
