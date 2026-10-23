@@ -126,7 +126,7 @@ YT_AUTO_PICK_MIN = 0.75       # below this, Download All leaves the track for a 
 # to change the window/title-bar icon. Leave as None to use the default.
 ICON_PATH = "icon.ico" #"my_icon.ico"
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 REPO_URL = "https://github.com/Basil-Black/TrackMatch"
 PROFILE_URL = "https://github.com/Basil-Black"
 
@@ -2947,18 +2947,19 @@ class ConversionCancelled(Exception):
     pass
 
 
-def convert_audio_file(src: Path, dest: Path, target, bitrate, running_procs, cancel_event):
+def convert_audio_file(src: Path, dest: Path, target, bitrate, running_procs, cancel_event, copy_audio=False):
     """Converts one file with ffmpeg into a temporary name next to dest,
     copies tags + cover across, checks the result's length matches the
     source, then renames it into place - so a failed or cancelled
     conversion never leaves a half-written file under the final name.
-    Returns the source length in seconds (or None)."""
+    copy_audio=True moves the audio across untouched instead of re-encoding
+    it (.aac into m4a). Returns the source length in seconds (or None)."""
     length, rate, bits, _ = _audio_info(src)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(f"{dest.stem}.converting.{target}")
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(src),
            "-map", "0:a:0", "-vn", "-map_metadata", "0",
-           *_ffmpeg_codec_args(target, bitrate, rate, bits), str(tmp)]
+           *(["-c:a", "copy"] if copy_audio else _ffmpeg_codec_args(target, bitrate, rate, bits)), str(tmp)]
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
                                 creationflags=_no_window_flags())
@@ -5555,6 +5556,36 @@ class MetadataEditorTab(LogPanelMixin, tk.Frame):
         style_label(self.names_status, subtle=True)
         self.names_status.pack(side="left", padx=(8, 0))
 
+        formats = make_section(self, "Make formats consistent (m4a)",
+                               "Turns songs that aren't m4a into m4a, one of two ways - you pick per song:\n\n"
+                               "• Convert: flac / wav / aiff convert cleanly (256kbps AAC). .aac files are "
+                               "moved into m4a with the audio untouched. mp3 / ogg / opus / wma can be converted "
+                               "too, but that's lossy to lossy - it loses a little more detail.\n"
+                               "• Download: gets the song again from YouTube as m4a (YouTube's own ~128kbps "
+                               "AAC, no re-encode). Only offered for lossy songs, and only picked for you when "
+                               "the upload is the same song and length. Songs at 256kbps or more start skipped - "
+                               "they're already better than YouTube's audio.\n\nThe new m4a keeps the song's tags "
+                               "and cover art and the same file name. The original goes to the " + TRASH_NAME +
+                               ", and .m3u / .m3u8 playlists in the folder are updated. Rekordbox, Serato and "
+                               "Traktor show replaced songs as missing, and cue points and beatgrids on the old "
+                               "files don't carry over.")
+        formats_text = tk.Label(formats, text="Makes every song in the music folder above m4a - converted, or "
+                                              "downloaded again from YouTube.",
+                                justify="left", anchor="w", wraplength=680)
+        style_label(formats_text, subtle=True)
+        formats_text.pack(fill="x")
+        formats_row = tk.Frame(formats); style_frame(formats_row)
+        formats_row.pack(fill="x", pady=(6, 0))
+        self.formats_button = ThemedButton(formats_row, text="Check Formats", command=self.check_formats_clicked)
+        self.formats_button.pack(side="left")
+        self.formats_stop = ThemedButton(formats_row, text="Stop", command=lambda: self.formats_cancel.set(),
+                                         state="disabled")
+        self.formats_stop.pack(side="left", padx=(6, 0))
+        self.formats_cancel = threading.Event()
+        self.formats_status = tk.Label(formats_row, text="", anchor="w")
+        style_label(self.formats_status, subtle=True)
+        self.formats_status.pack(side="left", padx=(8, 0))
+
         log_label = tk.Label(self, text="Log:"); style_label(log_label)
         log_label.pack(anchor="w", padx=12, pady=(8, 0))
         self.log_box = ThemedScrolledText(self, height=16, state="disabled", wrap="word")
@@ -5617,6 +5648,56 @@ class MetadataEditorTab(LogPanelMixin, tk.Frame):
             messagebox.showinfo("File names", f"All {len(items)} songs already have \"Artist - Title\" file names.")
         else:
             FileNameReviewWindow(self, folder, items, self.log)
+
+    def check_formats_clicked(self):
+        folder = self.folder_entry.get().strip()
+        if not folder or not Path(folder).is_dir():
+            messagebox.showerror("Missing info", "Choose a valid music folder.")
+            return
+        if not MutagenFile:
+            messagebox.showerror("Missing dependency", "Install requirements first:\npip install mutagen")
+            return
+        if yt_dlp is None:
+            self.log("NOTE: yt-dlp isn't installed, so songs can only be converted, not downloaded again.")
+        self.formats_cancel = threading.Event()
+        self.formats_button.configure(state="disabled")
+        self.formats_stop.configure(state="normal")
+        self.formats_status.configure(text="Reading tags...")
+
+        def progress(text):
+            try:
+                self.after(0, lambda: self.formats_status.configure(text=text))
+            except (tk.TclError, RuntimeError):
+                pass
+
+        def run():
+            try:
+                items = scan_formats(Path(folder), progress, self.formats_cancel)
+                self.after(0, lambda: self.formats_checked(Path(folder), items))
+            except Exception as e:
+                SESSION_LOG.exception(log_source_name(self), type(e), e, e.__traceback__)
+                self.after(0, lambda err=e: (self.formats_finished(""), messagebox.showerror("Error", str(err))))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def formats_finished(self, text):
+        self.formats_button.configure(state="normal")
+        self.formats_stop.configure(state="disabled")
+        self.formats_status.configure(text=text)
+
+    def formats_checked(self, folder, items):
+        counts = {}
+        for it in items:
+            counts[it["action"]] = counts.get(it["action"], 0) + 1
+        stopped = " (stopped - some songs weren't searched)" if self.formats_cancel.is_set() else ""
+        summary = (f"{len(items)} not m4a: {counts.get(UNIFY_DOWNLOAD, 0)} to download, "
+                   f"{counts.get(UNIFY_CONVERT, 0)} to convert, {counts.get(UNIFY_SKIP, 0)} skipped" + stopped)
+        self.formats_finished(summary)
+        self.log(f"\nChecked formats in {folder}: {summary}.")
+        if not items:
+            messagebox.showinfo("Formats", f"Every song in this folder is already m4a:\n{folder}")
+        else:
+            FormatReviewWindow(self, folder, items, self.log)
 
     def run_clicked(self):
         folder = self.folder_entry.get().strip()
@@ -6099,6 +6180,419 @@ class FileNameReviewWindow(tk.Toplevel):
         self.destroy()
 
 
+# ---------- Make formats consistent (Tagging tab) ----------
+# Songs that aren't m4a become m4a: converted with ffmpeg, or (lossy ones)
+# downloaded again from YouTube, whose m4a is its own AAC stream.
+
+UNIFY_TARGET = "m4a"
+UNIFY_BITRATE = "256"       # kbps for converted songs - what Apple sells
+UNIFY_KEEP_KBPS = 256       # lossy songs at or above this start skipped - better than YouTube's audio
+YT_AUDIO_KBPS = 128         # YouTube's m4a stream
+UNIFY_LENGTH_SLACK = 5      # seconds a YouTube upload's length may differ by and still be the same recording
+UNIFY_DOWNLOAD, UNIFY_CONVERT, UNIFY_SKIP = "Download", "Convert", "Skip"
+UNIFY_PROBLEMS = {
+    "taken": "an m4a with this name is already there",
+    "duplicate": "another song here would become the same m4a",
+}
+
+
+def pick_youtube_match(artist, title, length, results):
+    """(result, confident) for a song from YouTube search results: the best
+    ranked result that is the same song (is_same_song) and recording (length
+    within UNIFY_LENGTH_SLACK) and scores YT_AUTO_PICK_MIN, or else the best
+    ranked result as a weak guess. (None, False) when there are no results."""
+    track = {"title": title, "artist": artist, "duration_ms": length * 1000 if length else None}
+    ranked = rank_youtube_results(track, results)
+    for score, r in ranked:
+        yt_artist, yt_title = split_video_title(r["title"], r.get("uploader"))
+        channel = re.sub(r"\s*- Topic$", "", r.get("uploader") or "")
+        secs = r.get("duration_seconds")
+        if (score >= YT_AUTO_PICK_MIN
+                and is_same_song(normalize(title), artist, normalize(yt_title),
+                                 split_artists(yt_artist) | split_artists(channel))
+                and (not length or (secs and abs(secs - length) <= UNIFY_LENGTH_SLACK))):
+            return r, True
+    return (ranked[0][1], False) if ranked else (None, False)
+
+
+def unify_actions(item):
+    """What a song can be turned into m4a by: lossless and .aac songs only
+    convert (YouTube's audio is worse); lossy ones can also download."""
+    if item["kind"] in LOSSLESS_FORMATS or item["kind"] == "aac" or not item.get("match"):
+        return [UNIFY_CONVERT, UNIFY_SKIP]
+    return [UNIFY_DOWNLOAD, UNIFY_CONVERT, UNIFY_SKIP]
+
+
+def unify_default_action(item):
+    if item["kind"] in LOSSLESS_FORMATS or item["kind"] == "aac":
+        return UNIFY_CONVERT
+    if item["kbps"] and item["kbps"] >= UNIFY_KEEP_KBPS:
+        return UNIFY_SKIP
+    return UNIFY_DOWNLOAD if item.get("match") and item.get("confident") else UNIFY_SKIP
+
+
+def unify_note(item, action):
+    """(note, warn) shown next to a song for an action - warn when it costs
+    quality or the match needs checking."""
+    kind, kbps = item["kind"], item["kbps"]
+    source = f"{kbps}kbps {kind}" if kbps and kind not in LOSSLESS_FORMATS else kind
+    if action == UNIFY_DOWNLOAD:
+        if not item.get("confident"):
+            return "weak match - check it's the same version before replacing", True
+        return f"YouTube m4a (~{YT_AUDIO_KBPS}kbps) replaces the {source}", False
+    if action == UNIFY_CONVERT:
+        if kind in LOSSLESS_FORMATS:
+            return f"lossless - converts cleanly to {UNIFY_BITRATE}kbps m4a", False
+        if kind == "aac":
+            return "already AAC - moved into m4a with no quality change", False
+        return f"lossy to lossy - {source} re-encoded to {UNIFY_BITRATE}kbps loses a little detail", True
+    if kbps and kbps >= UNIFY_KEEP_KBPS and kind not in LOSSLESS_FORMATS:
+        return f"left as is - {kbps}kbps is already better than YouTube's ~{YT_AUDIO_KBPS}kbps", False
+    return f"left as is - {item.get('search_note') or 'not changed'}", False
+
+
+def scan_formats(folder: Path, progress=None, cancel_event=None):
+    """Every song in folder (and subfolders) that isn't m4a, with its tags,
+    bitrate and - for lossy songs - its YouTube match. Returns item dicts in
+    path order: path, dest, kind, kbps, length, artist, title, match,
+    confident, search_note, status ("ok" or a UNIFY_PROBLEMS key) and the
+    action it starts with."""
+    files = sorted(p for p in folder.rglob("*") if p.is_file() and p.suffix.lower() in AUDIO_EXTENSIONS
+                   and audio_kind(p) != UNIFY_TARGET)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        songs = list(pool.map(read_song_for_lookup, files))
+
+    items, claimed = [], set()
+    for path, song in zip(files, songs):
+        dest = path.with_suffix(f".{UNIFY_TARGET}")
+        if dest.exists():
+            status = "taken"
+        elif path_key(dest) in claimed:
+            status = "duplicate"
+        else:
+            status = "ok"
+            claimed.add(path_key(dest))
+        items.append({"path": path, "dest": dest, "kind": audio_kind(path),
+                      "kbps": round(song["bitrate"] / 1000) if song.get("bitrate") else None,
+                      "length": song["length"], "artist": song["existing"]["artist"],
+                      "title": song["existing"]["title"], "match": None, "confident": False,
+                      "search_note": "", "status": status})
+
+    to_search = [it for it in items if it["status"] == "ok" and it["kind"] not in LOSSLESS_FORMATS
+                 and it["kind"] != "aac"]
+    lock, done = threading.Lock(), [0]
+
+    def search(item):
+        if yt_dlp is None:
+            item["search_note"] = "yt-dlp isn't installed"
+        elif cancel_event is not None and cancel_event.is_set():
+            item["search_note"] = "not searched - the check was stopped"
+        else:
+            try:
+                query = f"{item['artist']} {item['title']}".strip()
+                results = search_youtube(query, max_results=YT_AUTO_SEARCH_RESULTS)
+                item["match"], item["confident"] = pick_youtube_match(item["artist"], item["title"],
+                                                                      item["length"], results)
+                if not item["match"]:
+                    item["search_note"] = "no YouTube results"
+                elif not item["confident"]:
+                    item["search_note"] = "no confident YouTube match"
+            except Exception as e:
+                item["search_note"] = f"YouTube search failed ({e})"
+        with lock:
+            done[0] += 1
+            if progress:
+                progress(f"Searching YouTube... {done[0]}/{len(to_search)}")
+
+    if progress and to_search:
+        progress(f"Searching YouTube... 0/{len(to_search)}")
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+        list(pool.map(search, to_search))
+    for it in items:
+        it["action"] = unify_default_action(it) if it["status"] == "ok" else UNIFY_SKIP
+    return items
+
+
+def replace_with_m4a(item, running_procs, cancel_event, log, progress=None):
+    """Makes one song's m4a at item["dest"] by its action - downloading
+    keeps the original's tags and cover (the YouTube thumbnail when it has
+    none) - checks the length, then sends the original to the Recycle Bin.
+    Returns a short status text."""
+    src, dest = item["path"], item["dest"]
+    if dest.exists():
+        raise FileExistsError("an m4a with this name is already there")
+    if item["action"] == UNIFY_DOWNLOAD:
+        temp_name = f"{src.stem}.downloading"
+        leftover = src.parent / f"{sanitize_filename(temp_name)}.{UNIFY_TARGET}"
+        if leftover.exists():
+            leftover.unlink()  # from a run that stopped before tagging it
+        tmp, _ = download_youtube_audio(item["match"]["url"], src.parent, UNIFY_TARGET, None, temp_name, log,
+                                        progress, cancel_event)
+        try:
+            if progress:
+                progress("Tagging...")
+            fields, image, mime = read_tags_and_cover(src)
+            if not image:
+                image, mime = youtube_cover_art(item["match"].get("thumbnail", ""))
+            embed_full_metadata(tmp, fields, image, mime)
+            new_length = _audio_info(tmp)[0]
+            if item["length"] and (not new_length or abs(new_length - item["length"]) > UNIFY_LENGTH_SLACK):
+                raise RuntimeError(f"the download is {format_duration(new_length)} long but the song is "
+                                   f"{format_duration(item['length'])} - not keeping it")
+            tmp.replace(dest)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+        done = "Downloaded"
+    else:
+        if progress:
+            progress("Converting...")
+        convert_audio_file(src, dest, UNIFY_TARGET, UNIFY_BITRATE, running_procs, cancel_event,
+                           copy_audio=item["kind"] == "aac")
+        done = "Converted"
+    try:
+        move_to_recycle_bin(src)
+        return f"{done} - original in the {TRASH_NAME}"
+    except OSError as e:
+        log(f"  Kept original {src.name} - {e}")
+        return f"{done} - original kept ({e})"
+
+
+class FormatReviewWindow(tk.Toplevel):
+    """Lists the songs that aren't m4a with what happens to each (Download /
+    Convert / Skip - click a row to change it) and why, and the ones that
+    can't be replaced at the bottom. Nothing changes until Replace is
+    clicked."""
+
+    def __init__(self, parent, folder, items, log):
+        super().__init__(parent)
+        self.title("TrackMatch - Make Formats Consistent")
+        self.geometry("1150x640")
+        style_window(self)
+        set_window_icon(self, ICON_PATH)
+        enable_dark_titlebar(self)
+        self.folder, self.log = folder, log
+        self.items = [it for it in items if it["status"] == "ok"]
+        self.problems = [it for it in items if it["status"] in UNIFY_PROBLEMS]
+        self.running = False
+        self.cancel_event = threading.Event()
+        self.running_procs = set()
+
+        header = tk.Label(
+            self,
+            text=f"{len(self.items)} song{plural(len(self.items))} can become m4a"
+                 + (f", {len(self.problems)} can't (listed at the bottom)" if self.problems else "")
+                 + ". Click a row to switch between Download, Convert and Skip. Orange rows lose a little "
+                   "quality or need checking. Each m4a keeps the song's tags, cover art and file name; the "
+                   f"original goes to the {TRASH_NAME} and playlists in this folder are updated. Nothing "
+                   "changes until you click Replace.",
+            justify="left", wraplength=1110)
+        style_label(header, subtle=True)
+        header.pack(anchor="w", padx=10, pady=(10, 6))
+
+        table = tk.Frame(self); style_frame(table)
+        table.pack(fill="both", expand=True, padx=10)
+        columns = (("action", "Action", 100), ("file", "Song", 330), ("format", "Now", 90),
+                   ("match", "YouTube match", 290), ("note", "", 320))
+        self.tree = ttk.Treeview(table, columns=[c[0] for c in columns], show="headings", selectmode="extended")
+        for key, title, width in columns:
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, stretch=key in ("file", "match", "note"))
+        scrollbar = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+        register(lambda: (self.tree.tag_configure("warn", foreground=THEME["MISSING_FG"]),
+                          self.tree.tag_configure("skip", foreground=THEME["SUBTLE_FG"]),
+                          self.tree.tag_configure("done", foreground=THEME["FOUND_FG"]),
+                          self.tree.tag_configure("failed", foreground=THEME["MISSING_FG"])))
+        for i, it in enumerate(self.items):
+            self.tree.insert("", "end", iid=str(i), values=("", self.shown(it["path"]), self.format_text(it),
+                                                            self.match_text(it), ""))
+            self.show_action(i)
+        for it in self.problems:
+            self.tree.insert("", "end", values=("", self.shown(it["path"]), self.format_text(it), "",
+                                                f"left as is - {UNIFY_PROBLEMS[it['status']]}"), tags=("warn",))
+        self.tree.bind("<ButtonRelease-1>", self.clicked)
+        self.tree.bind("<space>", lambda e: self.cycle(self.tree.selection()))
+
+        bottom = tk.Frame(self); style_frame(bottom)
+        bottom.pack(fill="x", padx=10, pady=10)
+        self.replace_btn = ThemedButton(bottom, text="", command=self.replace, accent=True)
+        self.replace_btn.pack(side="left")
+        self.defaults_btn = ThemedButton(bottom, text="Suggested", command=self.set_defaults)
+        self.defaults_btn.pack(side="left", padx=(6, 0))
+        self.skip_btn = ThemedButton(bottom, text="Skip All", command=self.skip_all)
+        self.skip_btn.pack(side="left", padx=(6, 0))
+        self.stop_btn = ThemedButton(bottom, text="Stop", command=self.stop, state="disabled")
+        self.stop_btn.pack(side="left", padx=(6, 0))
+        self.status = tk.Label(bottom, text="", anchor="w")
+        style_label(self.status, subtle=True)
+        self.status.pack(side="left", fill="x", expand=True, padx=10)
+        ThemedButton(bottom, text="Close", command=self.close, width=10).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.update_button()
+
+    def shown(self, path):
+        try:
+            return path.relative_to(self.folder).as_posix()
+        except ValueError:
+            return path.name
+
+    @staticmethod
+    def format_text(it):
+        return f"{it['kind']} {it['kbps']}k" if it["kbps"] and it["kind"] not in LOSSLESS_FORMATS else it["kind"]
+
+    @staticmethod
+    def match_text(it):
+        m = it.get("match")
+        if not m:
+            return ""
+        diff = ""
+        if it["length"] and m.get("duration_seconds"):
+            diff = f", {m['duration_seconds'] - it['length']:+.0f}s"
+        return f"{m['title']} ({m.get('uploader') or '?'}, {m['duration']}{diff})"
+
+    def pending(self):
+        return [i for i, it in enumerate(self.items) if it["action"] != UNIFY_SKIP and not it.get("done")]
+
+    def update_button(self):
+        jobs = self.pending()
+        self.replace_btn.configure(text=f"Replace {len(jobs)} Song{plural(len(jobs))}",
+                                   state="normal" if jobs and not self.running else "disabled")
+        for btn in (self.defaults_btn, self.skip_btn):
+            btn.configure(state="disabled" if self.running else "normal")
+        self.stop_btn.configure(state="normal" if self.running else "disabled")
+
+    def show_action(self, i):
+        it = self.items[i]
+        note, warn = unify_note(it, it["action"])
+        self.tree.set(str(i), "action", it["action"])
+        self.tree.set(str(i), "note", note)
+        self.tree.item(str(i), tags=("warn",) if warn else ("skip",) if it["action"] == UNIFY_SKIP else ())
+
+    def clicked(self, event):
+        if self.tree.identify_region(event.x, event.y) == "cell":
+            row = self.tree.identify_row(event.y)
+            if row:
+                self.cycle([row])
+
+    def cycle(self, rows):
+        if self.running:
+            return
+        for row in rows:
+            if row.isdigit() and not self.items[int(row)].get("done"):
+                it = self.items[int(row)]
+                actions = unify_actions(it)
+                it["action"] = actions[(actions.index(it["action"]) + 1) % len(actions)]
+                self.show_action(int(row))
+        self.update_button()
+
+    def set_all(self, pick):
+        if self.running:
+            return
+        for i, it in enumerate(self.items):
+            if not it.get("done"):
+                it["action"] = pick(it)
+                self.show_action(i)
+        self.update_button()
+
+    def set_defaults(self):
+        self.set_all(unify_default_action)
+
+    def skip_all(self):
+        self.set_all(lambda it: UNIFY_SKIP)
+
+    def stop(self):
+        self.cancel_event.set()
+        for proc in list(self.running_procs):
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        self.stop_btn.configure(state="disabled")
+        self.status.configure(text="Stopping - finishing up...")
+
+    def replace(self):
+        jobs = self.pending()
+        if not jobs:
+            return
+        self.running = True
+        self.cancel_event = threading.Event()
+        self.update_button()
+        self.status.configure(text="Replacing...")
+        self.log(f"Replacing {len(jobs)} songs with m4a...")
+        lock, counts, renamed = threading.Lock(), {"done": 0, "ok": 0, "failed": 0, "cancelled": 0}, {}
+
+        def set_note(i, text):
+            try:
+                self.after(0, lambda: self.tree.set(str(i), "note", text))
+            except (tk.TclError, RuntimeError):
+                pass
+
+        def one(i):
+            it = self.items[i]
+            rel = self.shown(it["path"])
+            outcome, result = "failed", None
+            try:
+                if self.cancel_event.is_set():
+                    outcome, result = "cancelled", None
+                else:
+                    text = replace_with_m4a(it, self.running_procs, self.cancel_event, self.log,
+                                            lambda t: set_note(i, t))
+                    with lock:
+                        renamed[path_key(it["path"])] = it["dest"].name
+                    it["done"] = True
+                    outcome, result = "ok", ("done", "Done", text)
+                    self.log(f"  {text}: {rel} -> {it['dest'].name}")
+            except Exception as e:
+                if self.cancel_event.is_set():
+                    outcome, result = "cancelled", None
+                else:
+                    result = ("failed", "Failed", str(e))
+                    self.log(f"  FAILED: {rel} - {e}")
+            with lock:
+                counts[outcome] += 1
+                counts["done"] += 1
+                n = counts["done"]
+            self.after(0, lambda: self.row_done(i, result, n, len(jobs)))
+
+        def run():
+            with KEEP_AWAKE, ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as pool:
+                list(pool.map(one, jobs))
+            playlists = update_playlists_for_renames(self.folder, renamed, self.log) if renamed else 0
+            text = (f"Replaced {counts['ok']} song{plural(counts['ok'])}"
+                    + (f", {counts['failed']} failed" if counts["failed"] else "")
+                    + (f", {counts['cancelled']} stopped" if counts["cancelled"] else "")
+                    + f", updated {playlists} playlist{plural(playlists)}.")
+            self.log(text)
+            self.after(0, lambda: self.finished(text))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def row_done(self, i, result, n, total):
+        if result is None:
+            self.show_action(i)
+        else:
+            tag, action, note = result
+            self.tree.item(str(i), tags=(tag,))
+            self.tree.set(str(i), "action", action)
+            self.tree.set(str(i), "note", note)
+        self.status.configure(text=f"Replacing... {n}/{total}")
+
+    def finished(self, text):
+        self.running = False
+        self.status.configure(text=text)
+        self.update_button()
+
+    def close(self):
+        if self.running:
+            messagebox.showinfo("Still working", "Songs are still being replaced - click Stop first, or wait for "
+                                                 "them to finish.", parent=self)
+            return
+        self.destroy()
+
+
 class MetadataReviewWindow(tk.Toplevel):
     """Lists every scanned file with its lookup matches, ranked by how
     closely they match the file's own title/artist. Each row has a picker
@@ -6389,6 +6883,7 @@ def read_song_for_lookup(path: Path):
         "source": fields.get("source"),
         "has_cover": bool(image),
         "length": getattr(getattr(audio, "info", None), "length", None),
+        "bitrate": getattr(getattr(audio, "info", None), "bitrate", None),  # bits per second
     }
 
 

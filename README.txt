@@ -1,4 +1,4 @@
-TRACKMATCH v1.0.0
+TRACKMATCH v1.1.0
 =================
 
 What this does
@@ -116,6 +116,14 @@ THE FIVE TABS
    looked up at a time, progress is saved so you can stop and resume, and
    the review is a compact table. Without it you'll get a warning before
    scanning 500+ songs.
+   Fix file names: renames songs to "Artist - Title" from their tags and
+   updates the .m3u / .m3u8 playlists in the folder.
+   Make formats consistent: turns every song that isn't m4a into m4a.
+   flac / wav / aiff and .aac are converted; mp3s under 256kbps (and
+   other lossy files) can be downloaded again from YouTube as m4a
+   instead of being re-encoded. Click a row to switch between Download,
+   Convert and Skip. Tags, cover art and file names are kept, originals
+   go to the Recycle Bin / Trash, and playlists in the folder are updated.
 
 4) CONVERT
    Converts a folder of songs between mp3, m4a, flac, wav and aiff,

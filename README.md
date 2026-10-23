@@ -25,6 +25,8 @@ Looks up every song in a folder and fills in **cover art, genre, label, year and
 - Every match is reviewed before anything is written. Weak or wrong-version matches (remixes, live versions, covers) are never applied automatically.
 - **Large library mode** (in Settings) handles thousands of songs: 3 lookups at a time, progress saved as it goes so scans can be stopped and resumed, and a compact review table.
 - Each tagged file gets a hidden tag recording where its metadata came from, so already-tagged songs can be skipped next time.
+- **Fix file names** renames songs to "Artist - Title" from their tags and updates the playlists in the folder.
+- **Make formats consistent** turns every song that isn't m4a into m4a: flac/wav/aiff and .aac are converted, and low-bitrate mp3s (and other lossy files) can be **downloaded again from YouTube** instead of re-encoded. You pick per song; tags, cover art and file names are kept, originals go to the Recycle Bin and playlists are updated.
 
 ### Convert
 Converts a folder of songs between **mp3, m4a, flac, wav and aiff**, keeping tags and cover art.
